@@ -345,7 +345,7 @@ cd HuntingSpirit
 
 **KangWooKim** - 게임 프로그래머
 - GitHub: [@KangWooKim](https://github.com/KangWooKim)
-- 프로젝트 시작: 2025년 4월
+- 프로젝트 시작: 2025년 5월
 - 개발 기간: 6개월 (진행 중)
 - 전문 분야: C++ 게임 개발, 언리얼 엔진, 네트워킹
 
