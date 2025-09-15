@@ -2,7 +2,7 @@
 
 **협동 보스 사냥 로그라이크 RPG**
 
-![Development Status](https://img.shields.io/badge/Status-In%20Development%20(65%25)-brightgreen)
+![Development Status](https://img.shields.io/badge/Status-In%20Development%20(80%25)-brightgreen)
 ![Engine](https://img.shields.io/badge/Engine-Unreal%20Engine%205-blue)
 ![Platform](https://img.shields.io/badge/Platform-PC-green)
 ![Language](https://img.shields.io/badge/Language-C%2B%2B-red)
