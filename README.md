@@ -12,713 +12,247 @@
 
 ## 📖 게임 소개
 
-HuntingSpirit은 플레이어들이 협동하여 랜덤 생성된 위험한 월드의 강력한 보스 몬스터를 사냥하는 로그라이크 RPG입니다. 매번 새로운 월드와 보스가 등장하여 끊임없는 도전과 전략적 사고를 요구합니다.
-
-### 🎯 핵심 컨셉
-- **협동 보스 사냥**: 플레이어들이 힘을 합쳐 강력한 보스를 처치
-- **절차적 월드 생성**: 매번 다른 환경과 도전
-- **전략적 성장**: 캐릭터 강화와 자원 관리의 중요성
-- **팀워크 필수**: 혼자서는 클리어 불가능한 도전적 난이도
-- **로그라이크 메타 진행**: 실패해도 영구적인 성장 요소
+HuntingSpirit는 플레이어들이 협동하여 절차적으로 생성된 위험 지역을 돌파하고, 강력한 레이드 보스를 사냥하는 로그라이크 RPG입니다. 매 라운드마다 세계와 적 구성이 새롭게 생성되며, 영구 성장 요소를 통해 반복적인 도전을 유도합니다.
 
 ---
 
-## 🔧 핵심 기술 세부사항
+## 🧠 아키텍처 하이라이트
 
-HuntingSpirit은 **최적화 기법과 아키텍처 패턴**을 적용하여 개발되었습니다. 다음은 프로젝트에서 구현된 핵심 기술들입니다:
+본 프로젝트는 대규모 협동 플레이를 염두에 둔 **네트워크 인프라**, **퍼포먼스 최적화**, **운영 자동화**를 중점으로 설계되었습니다. 아래는 현재 코드베이스에 구현된 핵심 기술 요약입니다.
 
-### 1. 🚀 고성능 오브젝트 풀링 시스템
+### 1. 🌐 지능형 매치메이킹 파이프라인
+**소스**: `Networking/Matchmaking/HSMatchmakingSystem.*`
 
-**구현 클래스**: `AHSObjectPool`, `IHSPoolableObject`  
-**위치**: `/Source/HuntingSpirit/Optimization/ObjectPool/`
-
-오브젝트 풀링은 빈번히 생성/삭제되는 게임 오브젝트(발사체, 파티클, 적 등)의 메모리 할당 오버헤드를 최소화합니다.
+- 실측 핑 데이터를 기반으로 지역 가중치를 계산하고, 세션 검색 결과에서 최적의 매치를 선별합니다.
+- 세션 검색/참여를 Unreal Online Subsystem에 직접 위임해 실제 서버에 접속합니다.
+- 매치 수락/거절 타임아웃, 지역별 대역폭 추적, 자동 재검색 로직을 포함합니다.
 
 ```cpp
-// HSObjectPool.h - 인터페이스 기반 풀링 시스템
-class HUNTINGSPIRIT_API IHSPoolableObject
-{
-    GENERATED_BODY()
-public:
-    // 오브젝트가 풀에서 활성화될 때 호출
-    UFUNCTION(BlueprintNativeEvent)
-    void OnActivated();
-    
-    // 오브젝트가 풀로 반환될 때 호출
-    UFUNCTION(BlueprintNativeEvent)
-    void OnDeactivated();
-};
-
-// HSObjectPool.cpp - 스택 기반 풀 관리
-AActor* AHSObjectPool::GetPooledObject()
-{
-    if (InactivePool.Num() > 0)
-    {
-        // 스택처럼 마지막 오브젝트를 가져옴 (캐시 친화적)
-        AActor* PooledObject = InactivePool.Last();
-        InactivePool.RemoveAt(InactivePool.Num() - 1);
-        ActivePool.Add(PooledObject);
-        
-        if (PooledObject->GetClass()->ImplementsInterface(UHSPoolableObject::StaticClass()))
-        {
-            IHSPoolableObject::Execute_OnActivated(PooledObject);
-        }
-        return PooledObject;
-    }
-    
-    // 동적 풀 확장 지원
-    if (bGrowWhenFull && ActivePool.Num() + InactivePool.Num() < MaxPoolSize)
-    {
-        return CreateNewPooledObject();
-    }
-    return nullptr;
-}
+// 지역별 핑 통계를 축적해 최적의 매치 후보를 고릅니다.
+FHSMatchInfo MatchInfo = BuildMatchInfoFromResult(*BestResult, BestRegion);
+UpdateMatchmakingStatus(EHSMatchmakingStatus::MatchFound);
+OnMatchFound.Broadcast(MatchInfo);
 ```
 
-**성능 개선**: 
-- 가비지 컬렉션 부담 95% 감소
-- 프레임 드롭 현상 제거
-- 메모리 단편화 방지
+### 2. 🎮 세션 라이프사이클 자동화
+**소스**: `Networking/SessionHandling/HSSessionManager.*`
 
-### 2. 🌍 절차적 월드 생성 시스템
-
-**구현 클래스**: `AHSWorldGenerator`, `FWorldChunk`, `UHSProceduralMeshGenerator`  
-**위치**: `/Source/HuntingSpirit/World/Generation/`
-
-청크 기반 월드 생성으로 무한한 게임플레이 경험을 제공합니다.
+- 빠른 매칭은 검색 완료 시 조건에 맞는 세션을 자동 선택·참여합니다.
+- 플레이어 추방/금지 시 OnlineSubsystem ID를 조회하여 실제 세션에서 제거합니다.
+- 핑/패킷 손실률을 실시간 측정하고, 재연결 시도 시 마지막 검색 결과를 활용합니다.
+- 24시간이 지난 밴 레코드와 오래된 세션 검색 결과를 자동 정리합니다.
 
 ```cpp
-// HSWorldGenerator.h - 청크 기반 월드 구조
-USTRUCT(BlueprintType)
-struct FWorldChunk
+if (SessionInterface->KickPlayer(*LocalPlayerId, NAME_GameSession, *TargetPlayerId))
 {
-    GENERATED_BODY()
-    
-    UPROPERTY(BlueprintReadWrite)
-    FIntPoint ChunkCoordinate;      // 청크 좌표
-    
-    UPROPERTY(BlueprintReadWrite)
-    UHSBiomeData* BiomeData;         // 바이옴 데이터
-    
-    UPROPERTY(BlueprintReadWrite)
-    TArray<AActor*> SpawnedActors;  // 스폰된 액터들
-    
-    UPROPERTY(BlueprintReadWrite)
-    float GenerationTime;            // 생성 시간 추적
-};
-
-// HSWorldGenerator.cpp - 비동기 청크 생성
-void AHSWorldGenerator::GenerateChunk(const FIntPoint& ChunkCoordinate)
-{
-    FWorldChunk NewChunk;
-    NewChunk.ChunkCoordinate = ChunkCoordinate;
-    
-    // 노이즈 기반 바이옴 결정
-    FVector ChunkWorldPos = ChunkToWorldLocation(ChunkCoordinate);
-    NewChunk.BiomeData = GetBiomeAtLocation(ChunkWorldPos);
-    
-    // 프로시저럴 메시 생성
-    if (UProceduralMeshComponent* TerrainMesh = GenerateTerrainMesh(ChunkCoordinate, NewChunk.BiomeData))
-    {
-        SpawnObjectsInChunk(NewChunk);  // 자원 및 적 배치
-        NewChunk.bIsGenerated = true;
-        GeneratedChunks.Add(ChunkCoordinate, NewChunk);
-        
-        // 진행 상황 브로드캐스트
-        float Progress = (float)GeneratedChunks.Num() / (float)(GenerationSettings.WorldSizeInChunks * GenerationSettings.WorldSizeInChunks);
-        OnWorldGenerationProgress.Broadcast(Progress, FString::Printf(TEXT("청크 %s 생성 완료"), *ChunkCoordinate.ToString()));
-    }
+    UE_LOG(LogTemp, Log, TEXT("플레이어 추방 성공 - %s"), *PlayerName);
 }
 ```
 
-**특징**:
-- 런타임 네비게이션 메시 생성
-- LOD 기반 청크 언로딩
-- 멀티스레드 생성 지원
+### 3. 🛠️ 전용 서버 오케스트레이션
+**소스**: `Networking/DedicatedServer/HSDedicatedServerManager.*`
 
-### 3. 🔗 우선순위 기반 네트워크 복제 시스템
-
-**구현 클래스**: `UHSReplicationComponent`, `FHSReplicationPacket`  
-**위치**: `/Source/HuntingSpirit/Networking/Replication/`
-
-대규모 멀티플레이어 환경에서 네트워크 트래픽을 최적화합니다.
+- CPU/메모리/네트워크/지연 시간 데이터를 플랫폼 API(Windows `GetSystemTimes`, Linux `/proc/stat`)로 측정합니다.
+- JWT/Basic 토큰을 파싱해 인증하며, 보안 이벤트는 `Saved/Logs/SecurityEvents.log`에 축적됩니다.
+- 서버 설정을 JSON으로 직렬화하여 `Saved/Server/HSServerConfig.json`에 저장합니다.
 
 ```cpp
-// HSReplicationComponent.h - 우선순위 시스템
-UENUM(BlueprintType)
-enum class EHSReplicationPriority : uint8
+if (ServerConfig->SaveConfigurationToFile(ConfigFilePath))
 {
-    RP_VeryLow      UMETA(DisplayName = "Very Low"),     // 장식품
-    RP_Low          UMETA(DisplayName = "Low"),          // 환경 오브젝트
-    RP_Normal       UMETA(DisplayName = "Normal"),       // 일반 게임 오브젝트
-    RP_High         UMETA(DisplayName = "High"),         // 플레이어, 중요한 적
-    RP_VeryHigh     UMETA(DisplayName = "Very High"),    // 보스
-    RP_Critical     UMETA(DisplayName = "Critical")      // 즉시 복제 필요
-};
-
-// HSReplicationComponent.cpp - 적응형 복제
-void UHSReplicationComponent::TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction)
-{
-    if (GetOwner()->HasAuthority())
-    {
-        // 거리 기반 우선순위 자동 조절
-        if (bDistanceBasedPriority)
-        {
-            UpdatePriorityBasedOnDistance();
-        }
-        
-        // 네트워크 대역폭에 따른 품질 조절
-        if (bAdaptiveQuality)
-        {
-            AdjustQualityBasedOnBandwidth();
-        }
-    }
-}
-
-bool UHSReplicationComponent::ReplicateData(const TArray<uint8>& Data, EHSReplicationPriority Priority, 
-                                           EHSReplicationChannel Channel, bool bReliable, bool bOrdered)
-{
-    // 우선순위에 따른 패킷 큐잉
-    FHSReplicationPacket NewPacket;
-    NewPacket.Priority = Priority;
-    NewPacket.Timestamp = GetWorld()->GetTimeSeconds();
-    
-    // Critical 우선순위는 즉시 전송
-    if (Priority == EHSReplicationPriority::RP_Critical)
-    {
-        return SendPacketImmediate(NewPacket);
-    }
-    
-    // 그 외는 배치 처리를 위해 큐에 추가
-    PacketQueue.Enqueue(NewPacket);
-    return true;
+    UE_LOG(LogTemp, Log, TEXT("서버 설정 저장 완료 - %s"), *ConfigFilePath);
 }
 ```
 
-**성능 이점**:
-- 네트워크 대역폭 40% 절약
-- 중요 데이터 우선 전송
-- 적응형 업데이트 빈도
+### 4. 🔁 거리 기반 어댑티브 복제
+**소스**: `Networking/Replication/HSReplicationComponent.*`
 
-### 4. ⚔️ 컴포넌트 기반 전투 시스템
-
-**구현 클래스**: `UHSCombatComponent`, `FHSDamageInfo`, `UHSHitReactionComponent`  
-**위치**: `/Source/HuntingSpirit/Combat/`
-
-확장 가능하고 유연한 전투 메커니즘을 제공합니다.
+- Critical 데이터는 즉시 전송, 일반 데이터는 배치 처리하여 대역폭을 절약합니다.
+- 멀티캐스트 시 수신자와의 거리를 계산해 범위 밖 클라이언트를 자동 필터링합니다.
+- 채널별 사용량과 대역폭 초과 이벤트를 추적합니다.
 
 ```cpp
-// HSCombatComponent.h - 델리게이트 기반 이벤트 시스템
-DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(FOnDamageReceived, 
-    float, DamageAmount, 
-    const FHSDamageInfo&, DamageInfo, 
-    AActor*, DamageInstigator);
-
-DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FOnCriticalHit, 
-    AActor*, Target, 
-    float, CriticalDamage);
-
-// HSCombatComponent.cpp - 데미지 처리 로직
-float UHSCombatComponent::ApplyDamage(const FHSDamageInfo& DamageInfo, AActor* DamageInstigator)
+const float Distance = FVector::Dist(Origin, TargetLocation);
+if (Distance <= MaxDistance && DispatchPacketToClient(Connection, Packet, Payload))
 {
-    // 방어력 및 저항 계산
-    float MitigatedDamage = CalculateMitigatedDamage(DamageInfo);
-    
-    // 크리티컬 히트 체크
-    if (FMath::FRandRange(0.0f, 100.0f) < CriticalChance)
-    {
-        MitigatedDamage *= CriticalMultiplier;
-        OnCriticalHit.Broadcast(GetOwner(), MitigatedDamage);
-    }
-    
-    // 체력 감소 및 이벤트 브로드캐스트
-    CurrentHealth = FMath::Clamp(CurrentHealth - MitigatedDamage, 0.0f, MaxHealth);
-    OnDamageReceived.Broadcast(MitigatedDamage, DamageInfo, DamageInstigator);
-    
-    // 사망 체크
-    if (CurrentHealth <= 0.0f && !bIsDead)
-    {
-        HandleDeath(DamageInstigator);
-    }
-    
-    return MitigatedDamage;
+    ++SuccessfulDispatches;
 }
 ```
 
-**특징**:
-- 데미지 타입별 처리
-- 버프/디버프 시스템
-- 확장 가능한 상태 효과
+### 5. 🌍 프로시저럴 월드 & 내비게이션 스트리밍
+**소스**: `World/Generation/HSWorldGenerator.*`, `World/Navigation/HSNavMeshGenerator.*`
 
-### 5. 🤝 팀 협동 메커니즘
-
-**구현 클래스**: `AHSTeamManager`, `UHSCoopMechanics`, `UHSSharedAbilitySystem`  
-**위치**: `/Source/HuntingSpirit/Cooperation/`
-
-보스 레이드에 필수적인 전략적 협동 플레이를 구현합니다.
+- 노이즈 기반 바이옴 결정, 멀티스레드 청크 생성, 런타임 메시 구축을 결합하여 무한 월드를 구성합니다.
+- 생성된 지형에 맞춰 내비메시를 즉시 재빌드하며, 필요한 자원 노드(`HSResourceNode`)와 상호작용 오브젝트를 스폰합니다.
+- 스트리밍 진행 상황을 델리게이트로 브로드캐스트해 로딩 UI와 동기화합니다.
 
 ```cpp
-// HSTeamManager.h - 팀 관리 시스템
-class HUNTINGSPIRIT_API AHSTeamManager : public AActor
+ProcessChunkGeneration();
+if (APlayerController* PC = UGameplayStatics::GetPlayerController(GetWorld(), 0))
 {
-public:
-    // 팀 시너지 효과 계산
-    UFUNCTION(BlueprintCallable)
-    float CalculateTeamSynergy(const TArray<AHSCharacterBase*>& TeamMembers);
-    
-    // 보상 분배 시스템
-    UFUNCTION(BlueprintCallable)
-    void DistributeRewards(const FHSRewardData& Rewards, const TMap<AHSCharacterBase*, float>& ContributionMap);
-};
-
-// HSCoopMechanics.cpp - 협동 스킬 시스템
-void UHSCoopMechanics::ExecuteCoopAbility(const FName& AbilityName, const TArray<AHSCharacterBase*>& Participants)
-{
-    // 최소 참여자 수 체크
-    if (Participants.Num() < GetMinParticipants(AbilityName))
+    if (APawn* PlayerPawn = PC->GetPawn())
     {
-        return;
+        UpdateChunksAroundPlayer(PlayerPawn->GetActorLocation());
     }
-    
-    // 시너지 보너스 계산
-    float SynergyBonus = CalculateSynergyBonus(Participants);
-    
-    // 협동 스킬 실행
-    for (AHSCharacterBase* Participant : Participants)
-    {
-        ApplyCoopEffect(Participant, AbilityName, SynergyBonus);
-    }
-    
-    // 팀 UI 업데이트
-    OnCoopAbilityExecuted.Broadcast(AbilityName, Participants);
 }
+CleanupDistantChunks();
 ```
 
-**핵심 기능**:
-- 역할 기반 팀 편성
-- 시너지 효과 계산
-- 기여도 기반 보상 분배
+### 6. 🧠 다단계 보스 페이즈 시스템
+**소스**: `Enemies/Bosses/HSBossPhaseSystem.*`, `Enemies/Bosses/HSBossAbilitySystem.*`, `AI/HSBossAIController.*`
 
-### 6. 🧠 계층적 AI 시스템
-
-**구현 클래스**: `AHSAIControllerBase`, `AHSBossAIController`  
-**위치**: `/Source/HuntingSpirit/AI/`
-
-Behavior Tree 기반의 적응형 AI를 구현합니다.
+- 보스 체력/기믹 조건에 따라 페이즈를 전환하며, 전환 중 무적 처리·연출 타이밍을 자동 관리합니다.
+- 각 페이즈는 능력 세트와 패턴을 독립적으로 보유하고 RPC를 통해 모든 클라이언트와 공유됩니다.
+- 페이즈 전이 횟수, 디버그 로그, 재진입 제한 등 레이드 밸런스 옵션을 제공합니다.
 
 ```cpp
-// HSBossAIController.h - 페이즈 기반 보스 AI
-class HUNTINGSPIRIT_API AHSBossAIController : public AHSAIControllerBase
+if (NewPhase != CurrentPhase && CanTransitionToPhase(NewPhase))
 {
-protected:
-    // 현재 보스 페이즈
-    UPROPERTY(BlueprintReadOnly)
-    int32 CurrentPhase;
-    
-    // 페이즈별 행동 트리
-    UPROPERTY(EditDefaultsOnly)
-    TMap<int32, UBehaviorTree*> PhaseBehaviorTrees;
-    
-public:
-    // 페이즈 전환 로직
-    UFUNCTION(BlueprintCallable)
-    void TransitionToPhase(int32 NewPhase);
-    
-    // 플레이어 예측 시스템
-    UFUNCTION(BlueprintCallable)
-    FVector PredictPlayerPosition(float PredictionTime);
-};
-
-// HSBossAIController.cpp - 적응형 난이도
-void AHSBossAIController::AdjustDifficultyBasedOnPlayerPerformance()
-{
-    float TeamSkillLevel = CalculateTeamSkillLevel();
-    
-    // 공격 패턴 조절
-    AttackFrequency = FMath::Lerp(BaseAttackFrequency, MaxAttackFrequency, TeamSkillLevel);
-    
-    // 반응 속도 조절
-    ReactionTime = FMath::Lerp(MaxReactionTime, MinReactionTime, TeamSkillLevel);
-    
-    // 예측 정확도 조절
-    PredictionAccuracy = FMath::Lerp(0.5f, 1.0f, TeamSkillLevel);
+    InternalSetPhase(NewPhase, /*bForce=*/false);
 }
 ```
 
-**AI 특징**:
-- 다단계 보스 패턴
-- 플레이어 행동 학습
-- 동적 난이도 조절
+### 7. 💾 로그라이크 메타 진행 & 저장소
+**소스**: `RoguelikeSystem/RunManagement/HSRunManager.*`, `RoguelikeSystem/Persistence/HSPersistentProgress.*`, `RoguelikeSystem/Progression/HSUnlockSystem.*`
 
-### 7. 🎲 로그라이크 진행 시스템
-
-**구현 클래스**: `AHSRunManager`, `FHSRunData`, `UHSPersistentProgress`  
-**위치**: `/Source/HuntingSpirit/RoguelikeSystem/RunManagement/`
-
-런 기반 게임플레이와 메타 진행을 관리합니다.
+- 런 시작/일시정지/종료를 서브시스템으로 관리하며, 보상 계산·통계 집계를 자동화합니다.
+- 진행도는 JSON 기반으로 `Saved/SaveGames/`에 저장되며, 자동 저장 타이머와 버전 마이그레이션 후킹을 제공합니다.
+- 승리/패배에 따라 메타 화폐, 해금 상태, 난이도 기록을 업데이트하여 반복 플레이 동기를 강화합니다.
 
 ```cpp
-// HSRunManager.h - 런 관리 시스템
-USTRUCT(BlueprintType)
-struct FHSRunData
-{
-    GENERATED_BODY()
-    
-    UPROPERTY(SaveGame)
-    int32 RunNumber;                    // 런 번호
-    
-    UPROPERTY(SaveGame)
-    float RunDuration;                   // 플레이 시간
-    
-    UPROPERTY(SaveGame)
-    TMap<FString, float> Statistics;    // 통계 데이터
-    
-    UPROPERTY(SaveGame)
-    TArray<FHSUnlockData> NewUnlocks;   // 해금된 콘텐츠
-};
+CurrentRun.Rewards = CalculateRunRewards();
+OnRunCompleted.Broadcast(Result, CurrentRun.Rewards);
+SaveProgressData();
+```
 
-// HSRunManager.cpp - 메타 진행 시스템
-void AHSRunManager::EndRun(bool bSuccess)
+### 8. 🤝 협동 시너지 네트워크
+**소스**: `Cooperation/TeamFormation/HSTeamFormationSystem.*`, `Cooperation/SharedAbilities/HSSharedAbilitySystem.*`, `Cooperation/Communication/HSCommunicationSystem.*`
+
+- 팀 매칭 후 역할 배분, 합동 스킬 쿨다운, 복합 보상 분배를 서브시스템 단위로 끊어 관리합니다.
+- 실시간 핑/핑백 툴, 합동 능력 발동 등 협력 액션을 멀티캐스트 RPC로 동기화합니다.
+- `HSSynchronizationSystem`과 연계해 팀 버프·합동 공격의 타이밍을 서버 기준으로 보정합니다.
+
+```cpp
+if (SharedAbilitySystem->TryActivateSharedAbility(AbilityId, Participants))
 {
-    FHSRunData CurrentRun;
-    CurrentRun.RunNumber = ++TotalRuns;
-    CurrentRun.RunDuration = GetWorld()->GetTimeSeconds() - RunStartTime;
-    
-    // 메타 화폐 계산
-    int32 MetaCurrency = CalculateMetaCurrency(CurrentRun, bSuccess);
-    PersistentProgress->AddMetaCurrency(MetaCurrency);
-    
-    // 언락 체크
-    CheckAndProcessUnlocks(CurrentRun);
-    
-    // 통계 저장
-    SaveRunStatistics(CurrentRun);
-    
-    // 다음 런을 위한 난이도 조절
-    AdjustNextRunDifficulty(CurrentRun, bSuccess);
+    OnSharedAbilityActivated.Broadcast(AbilityId, Participants);
 }
 ```
 
-**시스템 특징**:
-- 영구 진행도 저장
-- 조건 기반 언락
-- 통계 기반 밸런싱
+### 9. 🚀 성능 최적화 툴킷
+**소스**: `Optimization/HSPerformanceOptimizer.*`
 
----
+- 플랫폼별 CPU 사용률을 캐싱해 HUD/서버 모니터링에 제공하며, Windows/Linus 모두 지원합니다.
+- `FHighPerformanceObjectPool`은 활성/최대 용량을 추적하며, 동적 확장과 비트마스크 기반 상태 플래그를 제공합니다.
+- SIMD 벡터 배치 연산, XOR 델타 압축, 병렬 플레이어 업데이트 등 대량 데이터 처리를 최적화했습니다.
 
-## ⚔️ 캐릭터 클래스 & 스킬 시스템
-
-### 🛡️ 전사 (Warrior) - QWER 스킬 시스템
-- **무기**: 대검
-- **Q**: 방어 자세 (데미지 감소 + 반격)
-- **W**: 돌진 공격 (기동성 + 광역 데미지)
-- **E**: 회전베기 (360도 광역 공격)
-- **R**: 광폭화 (일정 시간 공격력 대폭 증가)
-
-### 🗡️ 시프 (Thief) - QWER 스킬 시스템
-- **무기**: 단검
-- **Q**: 은신 (투명화 + 이동속도 증가)
-- **W**: 질주 (빠른 이동 + 다음 공격 강화)
-- **E**: 회피 (무적 시간 + 위치 이동)
-- **R**: 연속공격 (빠른 다중 타격)
-
-### 🔮 마법사 (Mage) - QWER 스킬 시스템
-- **무기**: 스태프
-- **Q**: 화염구 (기본 원거리 공격)
-- **W**: 얼음창 (관통 + 슬로우 효과)
-- **E**: 번개 (즉시 발동 + 체인 데미지)
-- **R**: 메테오 (지연 시전 + 광역 폭발)
-
----
-
-## 🎮 주요 게임 특징
-
-### 🌍 절차적 월드 생성 시스템
-- 동적 바이옴 생성 및 환경 배치
-- 실시간 네비게이션 메시 생성
-- 자원 노드 및 상호작용 객체 자동 배치
-- 청크 기반 스트리밍으로 무한 월드 지원
-
-### 🤝 고급 협동 멀티플레이어
-- **데디케이트 서버**: 안정적인 멀티플레이어 환경
-- **스킬 기반 매치메이킹**: 실력에 따른 자동 매칭
-- **실시간 음성채팅 & 핑 시스템**: 원활한 의사소통
-- **공정한 보상 분배**: 기여도 기반 자동 분배 시스템
-
-### 📦 완전한 인벤토리 & 제작 시스템
-- **드래그 앤 드롭 UI**: 직관적인 아이템 관리
-- **비동기 제작 시스템**: 게임 성능에 영향 없는 제작
-- **스킬 기반 제작**: 제작 레벨 및 성공률 시스템
-- **레시피 데이터베이스**: 확장 가능한 제작 시스템
-
-### 📈 로그라이크 메타 진행 시스템
-- **영구 진행도**: 게임 간 지속되는 성장 요소
-- **메타 화폐 시스템**: 다양한 화폐를 통한 업그레이드
-- **언락 시스템**: 조건 기반 콘텐츠 해제
-- **통계 추적**: 플레이 패턴 분석 및 업적 시스템
-
-### ⚡ 최적화 기법
-- **오브젝트 풀링**: 메모리 할당 최소화
-- **SIMD 연산**: CPU 집약적 작업 가속화
-- **멀티스레딩**: 월드 생성 및 AI 처리 병렬화
-- **가상화 UI**: 대량 데이터 효율적 표시
-- **예측 네트워킹**: 지연 시간 보상 시스템
-
----
-
-## 🛠️ 기술 스택 & 아키텍처
-
-### 핵심 기술
-- **게임 엔진**: Unreal Engine 5.1+
-- **프로그래밍 언어**: C++ (표준 준수)
-- **네트워킹**: UE5 Replication + 커스텀 데디케이트 서버
-- **AI 시스템**: Behavior Tree + Blackboard
-- **최적화**: Object Pooling, Memory Pooling, SIMD
-
-### 아키텍처 설계
-- **모듈화된 컴포넌트 시스템**: 확장 가능한 구조
-- **이벤트 드리븐 아키텍처**: 느슨한 결합
-- **팩토리 패턴**: 동적 객체 생성
-- **옵저버 패턴**: 상태 변화 통지
-- **전략 패턴**: AI 행동 및 스킬 시스템
-
-### 코드 품질
-- **자가 검증 시스템**: 매개변수 타입 및 반환값 검증
-- **예외 처리**: 견고한 에러 처리 메커니즘
-- **메모리 관리**: 스마트 포인터 및 RAII 패턴
-- **문서화**: 한글 주석 및 API 문서
-
----
-
-## 📊 개발 진행도 (80% 완성)
-
-### ✅ 완성된 핵심 시스템 (Phase 1-5)
-
-#### 🎯 캐릭터 & 플레이어 시스템
-- [x] 3개 직업 캐릭터 완전 구현 (전사/시프/마법사)
-- [x] QWER 스킬 시스템 (각 직업별 4개 스킬)
-- [x] 플레이어 컨트롤러 & Enhanced Input 시스템
-- [x] 고급 카메라 시스템 (스무스 팔로우, 줌 제어)
-- [x] 스탯 시스템 (레벨링, 버프/디버프, 속성 관리)
-
-#### 🎮 게임 프레임워크
-- [x] 게임모드 & 게임스테이트 (멀티플레이어 지원)
-- [x] 플레이어 스테이트 (네트워크 동기화)
-- [x] 저장/로드 시스템 (비동기 처리, 압축/암호화)
-
-#### 🌍 월드 & 환경 시스템
-- [x] 절차적 월드 생성기 (바이옴, 청크 시스템)
-- [x] 동적 네비게이션 메시 생성
-- [x] 자원 노드 & 상호작용 객체
-- [x] 실시간 월드 스트리밍
-
-#### 🤖 AI & 적 시스템
-- [x] AI 컨트롤러 기반 적 시스템
-- [x] 보스 AI (페이즈 시스템, 능력 시스템)
-- [x] 적 스폰 시스템 (웨이브 매니저, 적응형 스폰)
-- [x] 기본 적 타입 (근접/원거리)
-
-#### ⚔️ 전투 & 스킬 시스템
-- [x] 전투 컴포넌트 (데미지 계산, 상태 효과)
-- [x] 무기 시스템 (근접/원거리)
-- [x] 발사체 시스템 (마법사 스킬용)
-- [x] 피격 반응 시스템
-
-#### 🤝 협동 & 네트워킹
-- [x] 팀 관리 시스템 (역할 기반 팀 편성)
-- [x] 협동 메커니즘 (공유 능력, 시너지 효과)
-- [x] 통신 시스템 (채팅, 음성, 핑)
-- [x] 보상 분배 시스템 (기여도 기반)
-- [x] 고급 동기화 시스템 (예측, 롤백)
-
-#### 🎒 인벤토리 & 제작
-- [x] 완전한 인벤토리 시스템 (드래그앤드롭, 정렬, 필터링)
-- [x] 비동기 제작 시스템 (스킬 레벨, 성공률)
-- [x] 레시피 데이터베이스 (JSON 지원)
-- [x] 채집 시스템
-
-#### 🎯 로그라이크 시스템
-- [x] 런 관리자 (통계 추적, 보상 계산)
-- [x] 메타 화폐 시스템 (다중 화폐 지원)
-- [x] 언락 시스템 (조건 기반 콘텐츠)
-- [x] 영구 진행도 (JSON 저장/로드)
-
-#### 🌐 네트워킹 & 서버
-- [x] 데디케이트 서버 시스템
-- [x] 스킬 기반 매치메이킹
-- [x] 세션 관리 (생성, 참가, 종료)
-- [x] 복제 시스템 (상태 동기화)
-
-#### 🎨 UI 시스템
-- [x] 게임 HUD (체력바, 스태미너바, 데미지 표시)
-- [x] 메인 메뉴 시스템 (매치메이킹 통합)
-- [x] 인벤토리 UI (가상화 최적화)
-
-#### ⚡ 최적화 & 성능
-- [x] 오브젝트 풀링 시스템
-- [x] 메모리 관리 최적화
-- [x] 성능 프로파일링 도구
-- [x] SIMD 연산 최적화
-
-### 🚧 현재 작업 중 (Phase 6-7)
-- [ ] 보스 몬스터 다양화 (추가 보스 타입)
-- [ ] 사운드 시스템 통합
-- [ ] 더 많은 아이템 타입
-- [ ] 접근성 기능 (색맹 모드, 컨트롤러 지원)
-
-### 📅 향후 개발 계획 (Phase 8-10)
-1. **Phase 8**: 시각/청각 폴리싱 (파티클, 사운드, 애니메이션)
-2. **Phase 9**: 접근성 기능 및 현지화
-3. **Phase 10**: QA, 밸런싱, 최종 최적화
-
----
-
-## 🚀 설치 및 실행
-
-### 시스템 요구사항
-- **최소**: Windows 10, GTX 2060, 16GB RAM
-- **권장**: Windows 11, RTX 3070, 32GB RAM
-- **개발 환경**: Unreal Engine 5.1+, Visual Studio 2022
-
-### 설치 방법
-```bash
-# 저장소 클론
-git clone https://github.com/KangWooKim/HuntingSpirit.git
-
-# 프로젝트 디렉토리로 이동
-cd HuntingSpirit
-
-# 프로젝트 파일 생성
-# HuntingSpirit.uproject 우클릭 -> Generate Visual Studio project files
+```cpp
+float UHSPerformanceOptimizer::GetCurrentCPUUsage()
+{
+    float Usage = FPlatformProcess::GetCPUUsage();
+    if (Usage >= 0.0f) { return CacheResult(Usage); }
+    return QueryPlatformSpecificUsage();
+}
 ```
 
-### 빌드 및 실행
-1. `HuntingSpirit.sln` 파일을 Visual Studio로 열기
-2. Development Editor 구성으로 빌드 (Ctrl + Shift + B)
-3. Unreal Editor에서 프로젝트 실행
-4. 멀티플레이어 테스트: Play → Number of Players: 4
+### 10. 📦 오브젝트 풀링
+**소스**: `Optimization/ObjectPool/HSObjectPool.*`
+
+- 인터페이스 기반으로 액터 생성/비활성화 생명주기를 관리하며, 필요 시 자동 확장합니다.
+- 풀링된 액터는 생성 즉시 숨김·충돌 비활성화 상태로 전환되어 즉시 재사용 가능합니다.
+
+```cpp
+AActor* AHSObjectPool::CreateNewPooledObject()
+{
+    AActor* NewObject = GetWorld()->SpawnActor<AActor>(PooledObjectClass, SpawnParams);
+    NewObject->SetActorHiddenInGame(true);
+    IHSPoolableObject::Execute_OnCreated(NewObject);
+    return NewObject;
+}
+```
 
 ---
 
-## 🎮 플레이 가이드
+## 🧪 테스트 & 운영 체크리스트
 
-### 기본 조작
-- **마우스**: 이동
-- **QWER**: 직업별 스킬
-- **I**: 인벤토리 열기
-- **E**: 상호작용 (채집, 문 열기 등)
-
-### 협동 플레이 팁
-1. **역할 분담**: 전사는 탱킹, 시프는 DPS, 마법사는 지원
-2. **자원 공유**: 팀원끼리 아이템과 자원을 나누어 사용
-3. **의사소통**: 핑 시스템과 채팅을 적극 활용
-4. **타이밍**: 스킬 조합으로 시너지 효과 창출
+- **Dedicated Server**: `HuntingSpiritServer` 타깃을 빌드하고 `-log`, `-port=<포트>` 옵션으로 실행합니다.
+- **클라이언트 매칭**: `HSMatchmakingSystem`으로 빠른 매치/수동 매치를 호출해 지역 자동선택과 세션 참가가 동작하는지 검증하세요.
+- **성능 모니터링**: 서버 실행 중 `HSDedicatedServerManager::OnPerformanceMetricsUpdated` 델리게이트를 구독해 실시간 데이터를 확인합니다.
+- **풀 사용률 확인**: `UHSAdvancedMemoryManager::GetPoolUsageRatio`를 통해 런타임 오브젝트 풀 상태를 모니터링합니다.
 
 ---
 
-## 🏗️ 아키텍처 & 디자인 패턴
+## 📁 폴더 구조
 
-### 핵심 디자인 패턴
-- **컴포넌트 패턴**: 모듈화된 기능 분리
-- **싱글톤 패턴**: 게임 매니저 클래스들
-- **팩토리 패턴**: 적/아이템 동적 생성
-- **옵저버 패턴**: 이벤트 시스템
-- **전략 패턴**: AI 행동 및 스킬 시스템
-- **State 패턴**: 게임 상태 관리
-
-### 성능 최적화 기법
-- **Object Pooling**: 빈번한 생성/삭제 객체 재사용
-- **Memory Pooling**: 메모리 할당 최소화
-- **SIMD Operations**: 수학 연산 벡터화
-- **Multithreading**: CPU 집약적 작업 병렬화
-- **LOD System**: 거리별 디테일 조절
-- **Occlusion Culling**: 보이지 않는 객체 렌더링 제외
-
-
----
-
-## 📚 문서 & 리소스
-
-### 개발 문서
-- [📋 개발 계획서](./Documentation/HuntingSpirit_개발계획서.md)
-- [🎒 인벤토리/제작 시스템 가이드](./Documentation/InventoryCraftingSystem_Guide.md)  
-- [🔧 에디터 작업 가이드](./Documentation/HuntingSpirit_EditorWorkGuide.txt)
-- [📊 개발 현황 보고서](./Documentation/HuntingSpirit_개발현황_종합보고서.md)
-
-### API 문서
-- 각 클래스의 헤더 파일에서 상세한 API 문서 확인
-- Doxygen 스타일 주석으로 문서화
-
----
-
-## 🏆 기술적 성취
-
-### 성능 최적화
-- **메모리 사용량 감소**: 오브젝트 풀링으로 가비지 컬렉션 최소화
-- **AI 처리 성능 향상**: 멀티스레딩 기반 Behavior Tree(진행중)
-- **네트워킹 지연 시간 감소**: 예측 시스템 및 보상 알고리즘(진행중)
-
-### 코드 품질
-- **SOLID 원칙 준수**: 확장 가능하고 유지보수 용이한 코드
-- **디자인 패턴 적용**: 23가지 패턴 중 8개 패턴 활용
-- **자동화 테스트**: 단위 테스트 및 통합 테스트 구현
-
----
-
-## 📞 문의 & 피드백
-
-### 연락처
-- **GitHub Issues**: 버그 리포트 및 기능 요청
-- **Discussion**: 개발 관련 토론 및 질문
-- **Email**: [GitHub 프로필 참조]
-
-### 피드백 환영
-- 게임플레이 밸런스 의견
-- 기술적 구현 제안
-- UI/UX 개선 아이디어
-- 성능 최적화 아이디어
+```
+Source/HuntingSpirit
+├── AI/
+│   ├── HSAIControllerBase.*
+│   └── HSBossAIController.*
+├── Characters/
+│   ├── Base/HSCharacterBase.*
+│   ├── Components/{HSAnimationComponent.*, HSCameraComponent.*}
+│   ├── Player/
+│   │   ├── HSPlayerCharacter.*, HSPlayerTypes.h
+│   │   ├── Mage/HSMageCharacter.*
+│   │   ├── Warrior/HSWarriorCharacter.*
+│   │   └── Thief/HSThiefCharacter.*
+│   └── Stats/{HSAttributeSet.*, HSLevelSystem.*, HSStatsComponent.*, HSStatsManager.*, HSLevelDataTable.h}
+├── Combat/
+│   ├── Damage/HSDamageType.h
+│   ├── Projectiles/HSMagicProjectile.*
+│   └── Weapons/HSWeaponBase.*
+├── Cooperation/
+│   ├── Communication/HSCommunicationSystem.*
+│   ├── Rewards/HSRewardsSystem.*
+│   ├── SharedAbilities/HSSharedAbilitySystem.*
+│   ├── Synchronization/HSSynchronizationSystem.*
+│   └── TeamFormation/HSTeamFormationSystem.*
+├── Enemies/
+│   ├── Base/HSEnemyBase.*
+│   ├── Bosses/{HSBossBase.*, HSBossPhaseSystem.*, HSBossAbilitySystem.*}
+│   ├── Regular/{HSBasicMeleeEnemy.*, HSBasicRangedEnemy.*}
+│   └── Spawning/{HSWaveManager.*, HSEnemySpawner.*, HSSpawnPoint.*}
+├── Gathering/
+│   ├── Crafting/{HSCraftingSystem.*, HSRecipeDatabase.*}
+│   ├── Harvesting/HSGatheringComponent.*
+│   └── Inventory/{HSInventoryComponent.*, HSInventoryUI.*}
+├── Items/HSItemBase.*
+├── Networking/
+│   ├── DedicatedServer/HSDedicatedServerManager.*
+│   ├── Matchmaking/HSMatchmakingSystem.*
+│   ├── Replication/HSReplicationComponent.*
+│   └── SessionHandling/HSSessionManager.*
+├── Optimization/
+│   ├── HSPerformanceOptimizer.*
+│   └── ObjectPool/HSObjectPool.*
+├── RoguelikeSystem/
+│   ├── Persistence/HSPersistentProgress.*
+│   ├── Progression/{HSMetaCurrency.*, HSUnlockSystem.*}
+│   └── RunManagement/HSRunManager.*
+├── UI/
+│   ├── HUD/HSGameHUD.*
+│   ├── Menus/HSMainMenuWidget.*
+│   └── Widgets/{HSHealthBarWidget.*, HSStaminaBarWidget.*, HSDamageNumberWidget.*}
+└── World/
+    ├── Environment/HSInteractableObject.*
+    ├── Generation/{HSWorldGenerator.*, HSLevelChunk.*, HSProceduralMeshGenerator.*, HSBiomeData.*}
+    ├── Navigation/{HSNavMeshGenerator.*, HSNavigationIntegration.*, HSRuntimeNavigation.*}
+    └── Resources/HSResourceNode.*
+```
 
 ---
 
-## 📝 라이선스
+## 🤝 기여 가이드 (요약)
 
-이 프로젝트는 개인 학습 및 포트폴리오 목적으로 제작되었습니다.
-상업적 사용을 원하시는 경우 별도 문의 바랍니다.
-
----
-
-## 👨‍💻 개발자 정보
-
-**KangWooKim** - 게임 프로그래머
-- GitHub: [@KangWooKim](https://github.com/KangWooKim)
-- 프로젝트 시작: 2025년 5월
-- 개발 기간: 6개월 (진행 중)
-- 전문 분야: C++ 게임 개발, 언리얼 엔진, 네트워킹
-
-### 개발 철학
-> "개발에서 사용하는 최적화 기법과 디자인 패턴을 적용하여,  
-> 실제 상용 게임 수준의 품질을 추구합니다."
+- 기능 추가 시 관련 서브시스템(매칭/세션/서버/복제/최적화)별 책임을 명확히 구분해주세요.
+- 새 API는 반드시 로그 카테고리(`LogHSPerformance`, `LogTemp`, …)를 지정해 디버깅 정보를 제공해야 합니다.
+- 플랫폼 종속 기능(예: CPU 사용률)은 `#if PLATFORM_*` 매크로로 구분하고 대체 경로를 마련합니다.
 
 ---
 
-## 🎯 프로젝트 목표
+## 📬 문의
 
-### 기술적 목표
-- [x] Unreal Engine 5 고급 기능 마스터
-- [ ] C++ 코드 작성 능력
-- [x] 멀티플레이어 게임 개발 경험
-- [x] 성능 최적화 기법 적용
-- [ ] 완성된 상용 게임 수준의 프로젝트
+- Discord Dev Room: `#huntingspirit-dev`
+- Issue Tracker: 다중 플랫폼 성능, 네트워크 회귀, 매치메이킹 버그 중심으로 태깅해주세요.
 
-### 학습 목표
-- [x] 로그라이크 게임 메커니즘 이해
-- [x] 협동 게임플레이 설계
-- [x] 대규모 프로젝트 관리
-- [x] 코드 아키텍처 설계
-- [ ] 게임 밸런싱 및 플레이어 경험 설계
-
----
-
-⭐ **이 프로젝트가 마음에 드셨다면 Star를 눌러주세요!**
-
-💡 **개발자들의 코드 리뷰와 피드백을 적극 환영합니다!**
+_게임의 핵심은 협동과 도전입니다. 안정적인 네트워크와 최적화된 퍼포먼스 위에서 최고의 협동 경험을 제공하겠습니다._
