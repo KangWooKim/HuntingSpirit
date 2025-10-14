@@ -2,6 +2,8 @@
 #include "HSWorldGenerator.h"
 #include "ProceduralMeshComponent.h"
 #include "Components/HierarchicalInstancedStaticMeshComponent.h"
+#include "Components/SceneComponent.h"
+#include "Components/PrimitiveComponent.h"
 #include "Engine/World.h"
 #include "Kismet/GameplayStatics.h"
 #include "NavigationSystem.h"
@@ -13,6 +15,9 @@
 AHSWorldGenerator::AHSWorldGenerator()
 {
     PrimaryActorTick.bCanEverTick = true;
+
+    USceneComponent* DefaultRoot = CreateDefaultSubobject<USceneComponent>(TEXT("Root"));
+    SetRootComponent(DefaultRoot);
     
     // 기본 설정
     GenerationSettings.WorldSizeInChunks = 20;
@@ -79,11 +84,13 @@ void AHSWorldGenerator::Tick(float DeltaTime)
 void AHSWorldGenerator::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
     StopWorldGeneration();
-    
+
     // 모든 생성된 청크 정리
-    for (auto& ChunkPair : GeneratedChunks)
+    TArray<FIntPoint> ChunkKeys;
+    GeneratedChunks.GetKeys(ChunkKeys);
+    for (const FIntPoint& ChunkCoord : ChunkKeys)
     {
-        UnloadChunk(ChunkPair.Key);
+        UnloadChunk(ChunkCoord);
     }
     GeneratedChunks.Empty();
     
@@ -166,9 +173,10 @@ void AHSWorldGenerator::GenerateChunk(const FIntPoint& ChunkCoordinate)
     {
         // 청크에 오브젝트 스폰
         SpawnObjectsInChunk(NewChunk);
-        
+
         NewChunk.bIsGenerated = true;
         NewChunk.GenerationTime = TotalGenerationTime;
+        NewChunk.SpawnedComponents.Add(TerrainMesh);
         
         // 청크 저장
         GeneratedChunks.Add(ChunkCoordinate, NewChunk);
@@ -202,7 +210,42 @@ void AHSWorldGenerator::UnloadChunk(const FIntPoint& ChunkCoordinate)
         }
     }
     Chunk->SpawnedActors.Empty();
-    
+
+    for (TObjectPtr<UPrimitiveComponent>& Component : Chunk->SpawnedComponents)
+    {
+        if (Component)
+        {
+            Component->DestroyComponent();
+        }
+    }
+    Chunk->SpawnedComponents.Empty();
+
+    for (FChunkInstancedMeshEntry& Entry : Chunk->InstancedMeshEntries)
+    {
+        if (UHierarchicalInstancedStaticMeshComponent* InstanceComponent = Entry.Component.Get())
+        {
+            Entry.InstanceIndices.Sort(TGreater<int32>());
+            for (int32 InstanceIndex : Entry.InstanceIndices)
+            {
+                const int32 InstanceCount = InstanceComponent->GetInstanceCount();
+                if (InstanceIndex >= 0 && InstanceIndex < InstanceCount)
+                {
+                    InstanceComponent->RemoveInstance(InstanceIndex);
+                }
+            }
+
+            if (InstanceComponent->GetInstanceCount() == 0)
+            {
+                if (UStaticMesh* Mesh = InstanceComponent->GetStaticMesh())
+                {
+                    InstancedMeshComponents.Remove(Mesh);
+                }
+                InstanceComponent->DestroyComponent();
+            }
+        }
+    }
+    Chunk->InstancedMeshEntries.Empty();
+
     // 청크 제거
     GeneratedChunks.Remove(ChunkCoordinate);
 }
@@ -357,12 +400,14 @@ UProceduralMeshComponent* AHSWorldGenerator::GenerateTerrainMesh(const FIntPoint
     {
         return nullptr;
     }
-    
+
     // 프로시저럴 메시 컴포넌트 생성
-    UProceduralMeshComponent* TerrainMesh = NewObject<UProceduralMeshComponent>(this);
+    UProceduralMeshComponent* TerrainMesh = NewObject<UProceduralMeshComponent>(this, UProceduralMeshComponent::StaticClass(), NAME_None, RF_Transient);
+    AddInstanceComponent(TerrainMesh);
+    TerrainMesh->SetupAttachment(RootComponent);
+    TerrainMesh->SetMobility(EComponentMobility::Movable);
     TerrainMesh->RegisterComponent();
-    TerrainMesh->AttachToComponent(RootComponent, FAttachmentTransformRules::KeepRelativeTransform);
-    
+
     // 지형 데이터 생성
     TArray<FVector> Vertices;
     TArray<int32> Triangles;
@@ -443,7 +488,7 @@ UProceduralMeshComponent* AHSWorldGenerator::GenerateTerrainMesh(const FIntPoint
     TerrainMesh->SetCollisionResponseToAllChannels(ECR_Block);
     
     TerrainMesh->SetWorldLocation(ChunkWorldPos);
-    
+
     return TerrainMesh;
 }
 
@@ -530,7 +575,7 @@ void AHSWorldGenerator::SpawnObjectsInChunk(FWorldChunk& Chunk)
     // 나머지 구현은 유사한 패턴으로 진행...
 }
 
-void AHSWorldGenerator::SpawnInstancedMesh(UStaticMesh* StaticMesh, const FTransform& Transform)
+void AHSWorldGenerator::SpawnInstancedMesh(FWorldChunk& Chunk, UStaticMesh* StaticMesh, const FTransform& Transform)
 {
     if (!StaticMesh)
     {
@@ -548,16 +593,32 @@ void AHSWorldGenerator::SpawnInstancedMesh(UStaticMesh* StaticMesh, const FTrans
     {
         // 새 인스턴스 컴포넌트 생성
         InstanceComponent = NewObject<UHierarchicalInstancedStaticMeshComponent>(this);
+        AddInstanceComponent(InstanceComponent);
+        InstanceComponent->SetupAttachment(RootComponent);
         InstanceComponent->SetStaticMesh(StaticMesh);
         InstanceComponent->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
+        InstanceComponent->SetMobility(EComponentMobility::Movable);
         InstanceComponent->RegisterComponent();
-        InstanceComponent->AttachToComponent(RootComponent, FAttachmentTransformRules::KeepRelativeTransform);
         
         InstancedMeshComponents.Add(StaticMesh, InstanceComponent);
     }
     
     // 인스턴스 추가
-    InstanceComponent->AddInstance(Transform);
+    const int32 InstanceIndex = InstanceComponent->AddInstance(Transform);
+
+    FChunkInstancedMeshEntry* Entry = Chunk.InstancedMeshEntries.FindByPredicate([InstanceComponent](const FChunkInstancedMeshEntry& Existing)
+    {
+        return Existing.Component == InstanceComponent;
+    });
+
+    if (!Entry)
+    {
+        FChunkInstancedMeshEntry& NewEntry = Chunk.InstancedMeshEntries.AddDefaulted_GetRef();
+        NewEntry.Component = InstanceComponent;
+        Entry = &NewEntry;
+    }
+
+    Entry->InstanceIndices.Add(InstanceIndex);
 }
 
 void AHSWorldGenerator::ProcessChunkGeneration()

@@ -10,6 +10,7 @@
 #include "Engine/NetDriver.h"
 #include "Engine/NetConnection.h"
 #include "GameFramework/PlayerController.h"
+#include "GameFramework/Pawn.h"
 #include "GameFramework/GameStateBase.h"
 #include "Kismet/KismetMathLibrary.h"
 #include "HAL/PlatformFilemanager.h"
@@ -200,47 +201,21 @@ bool UHSReplicationComponent::ReplicateData(const TArray<uint8>& Data, EHSReplic
         return false;
     }
 
-    // 패킷 생성
     FHSReplicationPacket Packet;
-    Packet.PacketID = NextPacketID++;
-    Packet.Timestamp = GetWorld()->GetTimeSeconds();
-    Packet.Priority = Priority;
-    Packet.Channel = Channel;
-    Packet.DataSize = Data.Num();
-    Packet.bReliable = bReliable;
-    Packet.bOrdered = bOrdered;
-
-    // 패킷 유효성 검사
-    if (!ValidatePacket(Packet))
+    TArray<uint8> PayloadToSend;
+    if (!PreparePayloadForTransmission(Data, Priority, Channel, bReliable, bOrdered, Packet, PayloadToSend))
     {
-        OnReplicationError.Broadcast(TEXT("Invalid packet"), -1);
         return false;
     }
 
-    // 데이터 압축 처리
-    TArray<uint8> ProcessedData = Data;
-    if (bCompressionEnabled && Data.Num() > 100) // 100바이트 이상일 때만 압축
-    {
-        ProcessedData = CompressData(Data);
-    }
-
-    // 델타 압축 처리
-    if (bDeltaCompressionEnabled && PreviousFrameData.Contains(Channel))
-    {
-        TArray<uint8> DeltaData = CalculateDelta(PreviousFrameData[Channel], ProcessedData);
-        if (DeltaData.Num() < ProcessedData.Num()) // 델타가 더 작은 경우만 사용
-        {
-            ProcessedData = DeltaData;
-        }
-    }
-
-    // 이전 프레임 데이터 저장 (델타 압축용)
-    PreviousFrameData.Add(Channel, ProcessedData);
+    const int32 PayloadSize = PayloadToSend.Num();
 
     // 배치 처리 또는 즉시 전송
     if (bBatchProcessingEnabled && Priority < EHSReplicationPriority::RP_Critical)
     {
-        PacketQueue.Add(Packet);
+        FHSQueuedReplicationPacket& QueuedPacket = PacketQueue.AddDefaulted_GetRef();
+        QueuedPacket.Packet = Packet;
+        QueuedPacket.Payload = MoveTemp(PayloadToSend);
         
         // 배치가 가득 찼거나 중요한 데이터인 경우 즉시 처리
         if (PacketQueue.Num() >= BatchSize || Priority >= EHSReplicationPriority::RP_VeryHigh)
@@ -251,19 +226,19 @@ bool UHSReplicationComponent::ReplicateData(const TArray<uint8>& Data, EHSReplic
     else
     {
         // 즉시 전송
-        MulticastReceiveData(Packet, ProcessedData);
+        MulticastReceiveData(Packet, PayloadToSend);
     }
 
     // 통계 업데이트
     {
         FScopeLock StatsLock(&StatisticsMutex);
         ReplicationStats.PacketsSent++;
-        ReplicationStats.TotalBytesSent += ProcessedData.Num();
+        ReplicationStats.TotalBytesSent += PayloadSize;
         
         if (ChannelStats.Contains(Channel))
         {
             ChannelStats[Channel].PacketsSent++;
-            ChannelStats[Channel].TotalBytesSent += ProcessedData.Num();
+            ChannelStats[Channel].TotalBytesSent += PayloadSize;
         }
     }
 
@@ -277,13 +252,59 @@ bool UHSReplicationComponent::ReplicateData(const TArray<uint8>& Data, EHSReplic
 bool UHSReplicationComponent::ReplicateDataToClient(const TArray<uint8>& Data, UNetConnection* TargetConnection,
                                                    EHSReplicationPriority Priority, EHSReplicationChannel Channel)
 {
-    if (!TargetConnection || !bReplicationEnabled)
+    if (!TargetConnection || !bReplicationEnabled || !GetOwner()->HasAuthority())
+    {
+        UE_LOG(LogTemp, Warning, TEXT("HSReplicationComponent: 대상 연결이 없거나 권한이 없습니다"));
+        return false;
+    }
+
+    if (!ChannelReplicationState.Contains(Channel) || !ChannelReplicationState[Channel])
+    {
+        UE_LOG(LogTemp, Warning, TEXT("HSReplicationComponent: 채널 %d가 비활성화되어 있습니다"), (int32)Channel);
+        return false;
+    }
+
+    if (Data.Num() == 0)
+    {
+        UE_LOG(LogTemp, Warning, TEXT("HSReplicationComponent: 빈 데이터를 특정 클라이언트로 전송하려고 시도했습니다"));
+        return false;
+    }
+
+    if (!CheckBandwidthLimit(Channel, Data.Num()))
+    {
+        OnBandwidthExceeded.Broadcast(Channel, Data.Num() / 1024.0f);
+        return false;
+    }
+
+    FHSReplicationPacket Packet;
+    TArray<uint8> PayloadToSend;
+    if (!PreparePayloadForTransmission(Data, Priority, Channel, /*bReliable=*/true, /*bOrdered=*/true, Packet, PayloadToSend))
     {
         return false;
     }
 
-    // 기본 복제 로직 활용 (간소화된 구현)
-    return ReplicateData(Data, Priority, Channel);
+    const int32 PayloadSize = PayloadToSend.Num();
+
+    if (!DispatchPacketToClient(TargetConnection, Packet, PayloadToSend))
+    {
+        OnReplicationPacketSent.Broadcast(Packet, false);
+        return false;
+    }
+
+    {
+        FScopeLock StatsLock(&StatisticsMutex);
+        ReplicationStats.PacketsSent++;
+        ReplicationStats.TotalBytesSent += PayloadSize;
+        
+        if (ChannelStats.Contains(Channel))
+        {
+            ChannelStats[Channel].PacketsSent++;
+            ChannelStats[Channel].TotalBytesSent += PayloadSize;
+        }
+    }
+
+    OnReplicationPacketSent.Broadcast(Packet, true);
+    return true;
 }
 
 // 멀티캐스트 복제
@@ -295,14 +316,86 @@ bool UHSReplicationComponent::MulticastReplication(const TArray<uint8>& Data, EH
         return false;
     }
 
-    // 거리 제한이 있는 경우 거리 확인
-    if (MaxDistance > 0.0f)
+    if (MaxDistance <= 0.0f)
     {
-        // 실제 구현에서는 각 클라이언트와의 거리를 확인하여 선별적으로 전송
-        // 여기서는 간소화된 구현
+        return ReplicateData(Data, Priority, Channel);
     }
 
-    return ReplicateData(Data, Priority, Channel);
+    if (!ChannelReplicationState.Contains(Channel) || !ChannelReplicationState[Channel])
+    {
+        UE_LOG(LogTemp, Warning, TEXT("HSReplicationComponent: 채널 %d가 비활성화되어 있어 멀티캐스트를 건너뜁니다"), static_cast<int32>(Channel));
+        return false;
+    }
+
+    FHSReplicationPacket Packet;
+    TArray<uint8> PayloadToSend;
+    if (!PreparePayloadForTransmission(Data, Priority, Channel, /*bReliable=*/true, /*bOrdered=*/true, Packet, PayloadToSend))
+    {
+        return false;
+    }
+
+    const int32 PayloadSize = PayloadToSend.Num();
+    const FVector Origin = GetOwner()->GetActorLocation();
+    int32 SuccessfulDispatches = 0;
+
+    if (UWorld* World = GetWorld())
+    {
+        if (UNetDriver* NetDriver = World->GetNetDriver())
+        {
+            for (UNetConnection* Connection : NetDriver->ClientConnections)
+            {
+                if (!Connection)
+                {
+                    continue;
+                }
+
+                FVector TargetLocation = Origin;
+                bool bHasLocation = false;
+
+                if (Connection->PlayerController && Connection->PlayerController->GetPawn())
+                {
+                    TargetLocation = Connection->PlayerController->GetPawn()->GetActorLocation();
+                    bHasLocation = true;
+                }
+                else if (Connection->OwningActor)
+                {
+                    TargetLocation = Connection->OwningActor->GetActorLocation();
+                    bHasLocation = true;
+                }
+
+                const float Distance = bHasLocation ? FVector::Dist(Origin, TargetLocation) : 0.0f;
+                if (bHasLocation && Distance > MaxDistance)
+                {
+                    continue;
+                }
+
+                if (!CheckBandwidthLimit(Channel, PayloadSize))
+                {
+                    OnBandwidthExceeded.Broadcast(Channel, PayloadSize / 1024.0f);
+                    continue;
+                }
+
+                if (DispatchPacketToClient(Connection, Packet, PayloadToSend))
+                {
+                    ++SuccessfulDispatches;
+                    {
+                        FScopeLock StatsLock(&StatisticsMutex);
+                        ReplicationStats.PacketsSent++;
+                        ReplicationStats.TotalBytesSent += PayloadSize;
+                        if (ChannelStats.Contains(Channel))
+                        {
+                            ChannelStats[Channel].PacketsSent++;
+                            ChannelStats[Channel].TotalBytesSent += PayloadSize;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    const bool bSucceeded = SuccessfulDispatches > 0;
+    OnReplicationPacketSent.Broadcast(Packet, bSucceeded);
+    return bSucceeded;
 }
 
 // 복제 중지
@@ -532,13 +625,8 @@ void UHSReplicationComponent::InitializeReplication()
         ChannelPair.Value = true;
     }
 
-    // 이전 프레임 데이터 초기화
-    PreviousFrameData.Empty();
-    for (int32 i = 0; i < (int32)EHSReplicationChannel::RC_VFX + 1; ++i)
-    {
-        EHSReplicationChannel Channel = (EHSReplicationChannel)i;
-        PreviousFrameData.Add(Channel, TArray<uint8>());
-    }
+    LastCompressedFrameData.Empty();
+    LastRawFrameData.Empty();
 
     UE_LOG(LogTemp, Log, TEXT("HSReplicationComponent: 복제 시스템 초기화 완료"));
 }
@@ -666,17 +754,16 @@ void UHSReplicationComponent::ProcessBatchedPackets()
     }
 
     // 우선순위별로 정렬
-    PacketQueue.Sort([](const FHSReplicationPacket& A, const FHSReplicationPacket& B)
+    PacketQueue.Sort([](const FHSQueuedReplicationPacket& A, const FHSQueuedReplicationPacket& B)
     {
-        return A.Priority > B.Priority; // 높은 우선순위가 먼저
+        return A.Packet.Priority > B.Packet.Priority; // 높은 우선순위가 먼저
     });
 
     // 패킷들을 일괄 처리
     int32 ProcessedCount = 0;
-    for (const FHSReplicationPacket& Packet : PacketQueue)
+    for (const FHSQueuedReplicationPacket& QueuedPacket : PacketQueue)
     {
-        // 실제 데이터 전송 (간소화된 구현)
-        // MulticastReceiveData(Packet, ProcessedData);
+        MulticastReceiveData(QueuedPacket.Packet, QueuedPacket.Payload);
         ProcessedCount++;
     }
 
@@ -763,6 +850,177 @@ void UHSReplicationComponent::AdjustQuality()
     }
 }
 
+bool UHSReplicationComponent::PreparePayloadForTransmission(const TArray<uint8>& Data, EHSReplicationPriority Priority,
+    EHSReplicationChannel Channel, bool bReliable, bool bOrdered,
+    FHSReplicationPacket& OutPacket, TArray<uint8>& OutPayload)
+{
+    OutPacket = FHSReplicationPacket();
+    OutPacket.PacketID = NextPacketID++;
+    OutPacket.Timestamp = GetWorld() ? GetWorld()->GetTimeSeconds() : 0.0f;
+    OutPacket.Priority = Priority;
+    OutPacket.Channel = Channel;
+    OutPacket.DataSize = Data.Num();
+    OutPacket.bReliable = bReliable;
+    OutPacket.bOrdered = bOrdered;
+    OutPacket.UncompressedSize = Data.Num();
+
+    if (!ValidatePacket(OutPacket))
+    {
+        OnReplicationError.Broadcast(TEXT("Invalid packet"), -1);
+        return false;
+    }
+
+    TArray<uint8> CompressedData = Data;
+    bool bUsedCompression = false;
+    if (bCompressionEnabled && Data.Num() > 100)
+    {
+        TArray<uint8> CandidateCompressed = CompressData(Data);
+        if (CandidateCompressed.Num() > 0 && CandidateCompressed.Num() < Data.Num())
+        {
+            CompressedData = MoveTemp(CandidateCompressed);
+            bUsedCompression = true;
+        }
+    }
+
+    TArray<uint8> Payload = CompressedData;
+    bool bUsedDeltaCompression = false;
+    const TArray<uint8>* PreviousCompressed = LastCompressedFrameData.Find(Channel);
+    if (bDeltaCompressionEnabled && PreviousCompressed && PreviousCompressed->Num() > 0)
+    {
+        TArray<uint8> DeltaData = CalculateDelta(*PreviousCompressed, CompressedData);
+        if (DeltaData.Num() > 0 && DeltaData.Num() < CompressedData.Num())
+        {
+            Payload = MoveTemp(DeltaData);
+            bUsedDeltaCompression = true;
+        }
+    }
+
+    LastCompressedFrameData.Add(Channel, CompressedData);
+    LastRawFrameData.Add(Channel, Data);
+
+    OutPacket.bWasCompressed = bUsedCompression;
+    OutPacket.bWasDeltaCompressed = bUsedDeltaCompression;
+    OutPacket.DataSize = Payload.Num();
+
+    OutPayload = MoveTemp(Payload);
+    return true;
+}
+
+void UHSReplicationComponent::HandleIncomingPayload(const FHSReplicationPacket& Packet, const TArray<uint8>& Data)
+{
+    AActor* OwnerActor = GetOwner();
+    if (!OwnerActor || OwnerActor->HasAuthority())
+    {
+        return;
+    }
+
+    bool bSuccess = true;
+    TArray<uint8> ReconstructedCompressedPayload = Data;
+
+    if (Packet.bWasDeltaCompressed)
+    {
+        const TArray<uint8>* PreviousCompressed = LastCompressedFrameData.Find(Packet.Channel);
+        if (PreviousCompressed && PreviousCompressed->Num() > 0)
+        {
+            ReconstructedCompressedPayload = ApplyDelta(*PreviousCompressed, Data);
+        }
+        else
+        {
+            UE_LOG(LogTemp, Warning, TEXT("HSReplicationComponent: 델타 복원 실패 - 기준 데이터 없음 (채널 %d, 패킷 %d)"),
+                   (int32)Packet.Channel, Packet.PacketID);
+            bSuccess = false;
+        }
+    }
+
+    TArray<uint8> RawPayload;
+    if (bSuccess)
+    {
+        if (Packet.bWasCompressed)
+        {
+            RawPayload = DecompressData(ReconstructedCompressedPayload, Packet.UncompressedSize);
+            if (Packet.UncompressedSize > 0 && RawPayload.Num() != Packet.UncompressedSize)
+            {
+                UE_LOG(LogTemp, Warning, TEXT("HSReplicationComponent: 압축 해제 실패 (채널 %d, 패킷 %d)"),
+                       (int32)Packet.Channel, Packet.PacketID);
+                bSuccess = false;
+            }
+        }
+        else
+        {
+            RawPayload = ReconstructedCompressedPayload;
+        }
+    }
+
+    if (bSuccess)
+    {
+        LastCompressedFrameData.Add(Packet.Channel, ReconstructedCompressedPayload);
+        LastRawFrameData.Add(Packet.Channel, RawPayload);
+
+        {
+            FScopeLock StatsLock(&StatisticsMutex);
+            ReplicationStats.PacketsReceived++;
+            ReplicationStats.TotalBytesReceived += Data.Num();
+        }
+
+        OnReplicationPacketReceived.Broadcast(Packet, true);
+        OnReplicationPayloadReady.Broadcast(Packet, RawPayload, Packet.bWasDeltaCompressed);
+
+        ServerReceiveAcknowledgment(Packet.PacketID, true);
+    }
+    else
+    {
+        OnReplicationPacketReceived.Broadcast(Packet, false);
+        ServerReceiveAcknowledgment(Packet.PacketID, false);
+    }
+}
+
+bool UHSReplicationComponent::DispatchPacketToClient(UNetConnection* TargetConnection, const FHSReplicationPacket& Packet, const TArray<uint8>& Payload)
+{
+    if (!TargetConnection)
+    {
+        return false;
+    }
+
+    UHSReplicationComponent* TargetComponent = nullptr;
+
+    if (AActor* OwnerActor = TargetConnection->OwningActor)
+    {
+        TargetComponent = OwnerActor->FindComponentByClass<UHSReplicationComponent>();
+    }
+
+    if (!TargetComponent && TargetConnection->PlayerController)
+    {
+        TargetComponent = TargetConnection->PlayerController->FindComponentByClass<UHSReplicationComponent>();
+    }
+
+    if (!TargetComponent && TargetConnection->PlayerController && TargetConnection->PlayerController->GetPawn())
+    {
+        TargetComponent = TargetConnection->PlayerController->GetPawn()->FindComponentByClass<UHSReplicationComponent>();
+    }
+
+    if (!TargetComponent && TargetConnection->OwningActor == GetOwner())
+    {
+        TargetComponent = this;
+    }
+
+    if (!TargetComponent)
+    {
+        UE_LOG(LogTemp, Warning, TEXT("HSReplicationComponent: 대상 연결에 HSReplicationComponent가 없습니다 (패킷 %d)"), Packet.PacketID);
+        return false;
+    }
+
+    if (Packet.bReliable)
+    {
+        TargetComponent->ClientReceiveDataReliable(Packet, Payload);
+    }
+    else
+    {
+        TargetComponent->ClientReceiveDataUnreliable(Packet, Payload);
+    }
+
+    return true;
+}
+
 // 데이터 압축
 TArray<uint8> UHSReplicationComponent::CompressData(const TArray<uint8>& Data) const
 {
@@ -771,17 +1029,13 @@ TArray<uint8> UHSReplicationComponent::CompressData(const TArray<uint8>& Data) c
         return Data;
     }
 
-    // Unreal Engine의 압축 시스템 사용
-    TArray<uint8> CompressedData;
-    int32 UncompressedSize = Data.Num();
-    int32 CompressedSize = FMath::Max(1, UncompressedSize); // 최소 크기 보장
+    const int32 UncompressedSize = Data.Num();
+    int32 CompressedSize = FMath::TruncToInt(FMath::Max(32.0f, UncompressedSize * 1.1f));
 
-    // 압축 버퍼 할당
+    TArray<uint8> CompressedData;
     CompressedData.SetNumUninitialized(CompressedSize);
 
-    // zlib 압축 사용 (UE5에서 기본 지원)
-    if (FCompression::CompressMemory(NAME_Zlib, CompressedData.GetData(), CompressedSize, 
-                                   Data.GetData(), UncompressedSize, COMPRESS_BiasMemory))
+    if (FCompression::CompressMemory(NAME_Zlib, CompressedData.GetData(), CompressedSize, Data.GetData(), UncompressedSize, COMPRESS_BiasMemory))
     {
         CompressedData.SetNum(CompressedSize);
         return CompressedData;
@@ -792,21 +1046,27 @@ TArray<uint8> UHSReplicationComponent::CompressData(const TArray<uint8>& Data) c
 }
 
 // 데이터 압축 해제
-TArray<uint8> UHSReplicationComponent::DecompressData(const TArray<uint8>& CompressedData) const
+TArray<uint8> UHSReplicationComponent::DecompressData(const TArray<uint8>& CompressedData, int32 UncompressedSize) const
 {
     if (CompressedData.Num() == 0)
     {
         return CompressedData;
     }
 
-    // 압축 해제 구현 (간소화된 버전)
-    // 실제 구현에서는 압축 시 저장한 메타데이터를 사용해야 함
-    TArray<uint8> DecompressedData;
-    
-    // 압축 해제 로직
-    // ...
+    if (UncompressedSize <= 0)
+    {
+        return TArray<uint8>();
+    }
 
-    return DecompressedData;
+    TArray<uint8> DecompressedData;
+    DecompressedData.SetNumUninitialized(UncompressedSize);
+
+    if (FCompression::UncompressMemory(NAME_Zlib, DecompressedData.GetData(), UncompressedSize, CompressedData.GetData(), CompressedData.Num()))
+    {
+        return DecompressedData;
+    }
+
+    return TArray<uint8>();
 }
 
 // 델타 압축 계산
@@ -926,18 +1186,17 @@ int32 UHSReplicationComponent::CalculateConnectionQuality() const
 // 멀티캐스트 데이터 수신
 void UHSReplicationComponent::MulticastReceiveData_Implementation(const FHSReplicationPacket& Packet, const TArray<uint8>& Data)
 {
-    // 클라이언트에서 데이터 수신 처리
-    if (!GetOwner()->HasAuthority())
-    {
-        FScopeLock StatsLock(&StatisticsMutex);
-        ReplicationStats.PacketsReceived++;
-        ReplicationStats.TotalBytesReceived += Data.Num();
-        
-        OnReplicationPacketReceived.Broadcast(Packet, true);
-        
-        // 서버에 수신 확인 전송
-        ServerReceiveAcknowledgment(Packet.PacketID, true);
-    }
+    HandleIncomingPayload(Packet, Data);
+}
+
+void UHSReplicationComponent::ClientReceiveDataReliable_Implementation(const FHSReplicationPacket& Packet, const TArray<uint8>& Data)
+{
+    HandleIncomingPayload(Packet, Data);
+}
+
+void UHSReplicationComponent::ClientReceiveDataUnreliable_Implementation(const FHSReplicationPacket& Packet, const TArray<uint8>& Data)
+{
+    HandleIncomingPayload(Packet, Data);
 }
 
 // 서버 수신 확인
@@ -1010,15 +1269,10 @@ void UHSReplicationComponent::LogReplicationStatistics() const
 // 사용하지 않는 데이터 정리
 void UHSReplicationComponent::CleanupUnusedData()
 {
-    // 오래된 이전 프레임 데이터 정리
-    const float MaxAge = 5.0f; // 5초 이상 된 데이터 제거
-    float CurrentTime = GetWorld()->GetTimeSeconds();
-    
-    // 패킷 큐 최적화
     OptimizePacketQueue();
-    
-    // 메모리 압축
     PacketQueue.Shrink();
+    LastCompressedFrameData.Compact();
+    LastRawFrameData.Compact();
 }
 
 // 패킷 큐 최적화
@@ -1026,13 +1280,12 @@ void UHSReplicationComponent::OptimizePacketQueue()
 {
     if (PacketQueue.Num() > BatchSize * 2)
     {
-        // 오래된 패킷 제거
-        float CurrentTime = GetWorld()->GetTimeSeconds();
-        PacketQueue.RemoveAll([CurrentTime](const FHSReplicationPacket& Packet)
+        const float CurrentTime = GetWorld()->GetTimeSeconds();
+        PacketQueue.RemoveAll([CurrentTime](const FHSQueuedReplicationPacket& Entry)
         {
-            return (CurrentTime - Packet.Timestamp) > 1.0f; // 1초 이상 된 패킷 제거
+            return (CurrentTime - Entry.Packet.Timestamp) > 1.0f; // 1초 이상 된 패킷 제거
         });
-        
+
         PacketQueue.Shrink();
     }
 }

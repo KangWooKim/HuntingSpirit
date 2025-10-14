@@ -2,15 +2,63 @@
 #include "Engine/World.h"
 #include "Engine/GameInstance.h"
 #include "Engine/NetDriver.h"
+#include "GameFramework/PlayerState.h"
+#include "Engine/NetConnection.h"
 #include "Engine/Engine.h"
 #include "TimerManager.h"
 #include "HAL/PlatformProcess.h"
 #include "HAL/PlatformFilemanager.h"
+#include "HAL/PlatformMemory.h"
 #include "Misc/DateTime.h"
 #include "Misc/Guid.h"
+#include "Misc/FileHelper.h"
+#include "Misc/Paths.h"
+#include "Misc/Base64.h"
+#include "Serialization/JsonReader.h"
+#include "Serialization/JsonSerializer.h"
 #include "SocketSubsystem.h"
 #include "Sockets.h"
 #include "Common/TcpSocketBuilder.h"
+
+namespace
+{
+    FString NormalizeBase64Url(const FString& Input)
+    {
+        FString Result = Input;
+        Result.ReplaceInline(TEXT("-"), TEXT("+"));
+        Result.ReplaceInline(TEXT("_"), TEXT("/"));
+        while (Result.Len() % 4 != 0)
+        {
+            Result.AppendChar(TEXT('='));
+        }
+        return Result;
+    }
+
+    bool DecodeBase64Url(const FString& Input, FString& Output)
+    {
+        const FString Normalized = NormalizeBase64Url(Input);
+        return FBase64::Decode(Normalized, Output);
+    }
+
+    bool ParseJwtPayload(const FString& Token, TSharedPtr<FJsonObject>& OutPayload)
+    {
+        TArray<FString> Segments;
+        Token.ParseIntoArray(Segments, TEXT("."), true);
+        if (Segments.Num() < 2)
+        {
+            return false;
+        }
+
+        FString PayloadJson;
+        if (!DecodeBase64Url(Segments[1], PayloadJson))
+        {
+            return false;
+        }
+
+        TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(PayloadJson);
+        return FJsonSerializer::Deserialize(Reader, OutPayload) && OutPayload.IsValid();
+    }
+}
 
 UHSDedicatedServerManager::UHSDedicatedServerManager()
 {
@@ -34,6 +82,9 @@ UHSDedicatedServerManager::UHSDedicatedServerManager()
     
     // 성능 캐싱 초기화
     LastMetricsUpdateTime = 0.0f;
+    LastRecordedInBytes = 0;
+    LastRecordedOutBytes = 0;
+    LastNetworkSampleSeconds = 0.0;
 }
 
 void UHSDedicatedServerManager::Initialize(FSubsystemCollectionBase& Collection)
@@ -463,10 +514,28 @@ void UHSDedicatedServerManager::LoadServerConfig(EHSServerEnvironment Environmen
 
 void UHSDedicatedServerManager::SaveServerConfig()
 {
-    if (ServerConfig)
+    if (!ServerConfig)
     {
-        // 실제 구현에서는 파일 시스템에 저장
-        UE_LOG(LogTemp, Log, TEXT("HSDedicatedServerManager: 서버 설정 저장 완료"));
+        UE_LOG(LogTemp, Warning, TEXT("HSDedicatedServerManager: 저장할 서버 설정이 없습니다"));
+        return;
+    }
+
+    const FString ConfigDirectory = FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("Server"));
+    IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
+    if (!PlatformFile.DirectoryExists(*ConfigDirectory))
+    {
+        PlatformFile.CreateDirectoryTree(*ConfigDirectory);
+    }
+
+    const FString ConfigFilePath = FPaths::Combine(ConfigDirectory, TEXT("HSServerConfig.json"));
+
+    if (ServerConfig->SaveConfigurationToFile(ConfigFilePath))
+    {
+        UE_LOG(LogTemp, Log, TEXT("HSDedicatedServerManager: 서버 설정 저장 완료 - %s"), *ConfigFilePath);
+    }
+    else
+    {
+        UE_LOG(LogTemp, Error, TEXT("HSDedicatedServerManager: 서버 설정 저장 실패 - %s"), *ConfigFilePath);
     }
 }
 
@@ -760,44 +829,161 @@ void UHSDedicatedServerManager::UpdatePlayerConnectionMetrics()
 {
     FScopeLock Lock(&PlayerMutex);
     
+    TMap<FString, float> LatestPingByPlayer;
+    if (UWorld* World = GetWorld())
+    {
+        if (UNetDriver* NetDriver = World->GetNetDriver())
+        {
+            for (UNetConnection* Connection : NetDriver->ClientConnections)
+            {
+                if (!Connection)
+                {
+                    continue;
+                }
+
+                FString ConnectionPlayerId;
+                if (Connection->PlayerController && Connection->PlayerController->PlayerState && Connection->PlayerController->PlayerState->GetUniqueId().IsValid())
+                {
+                    ConnectionPlayerId = Connection->PlayerController->PlayerState->GetUniqueId()->ToString();
+                }
+                else if (Connection->PlayerId.IsValid())
+                {
+                    ConnectionPlayerId = Connection->PlayerId->ToString();
+                }
+
+                if (!ConnectionPlayerId.IsEmpty())
+                {
+                    LatestPingByPlayer.Add(ConnectionPlayerId, Connection->AvgLag * 1000.0f);
+                }
+            }
+        }
+    }
+
+    const FDateTime NowUtc = FDateTime::UtcNow();
+
     for (auto& PlayerPair : ConnectedPlayers)
     {
         FHSPlayerConnectionInfo& PlayerInfo = PlayerPair.Value;
-        
-        // 연결 지속시간 업데이트
-        PlayerInfo.ConnectionDuration = (FDateTime::Now() - PlayerInfo.ConnectionTime).GetTotalSeconds();
-        
-        // 핑 시뮬레이션 (실제 구현에서는 실제 핑 측정)
-        PlayerInfo.Ping = FMath::RandRange(10.0f, 100.0f);
+        PlayerInfo.ConnectionDuration = (NowUtc - PlayerInfo.ConnectionTime).GetTotalSeconds();
+
+        if (const float* PingMs = LatestPingByPlayer.Find(PlayerInfo.PlayerID))
+        {
+            PlayerInfo.Ping = *PingMs;
+        }
     }
 }
 
 void UHSDedicatedServerManager::CollectCPUMetrics()
 {
-    // 실제 구현에서는 플랫폼별 CPU 사용률 측정
-    CurrentMetrics.CPUUsagePercent = FMath::RandRange(10.0f, 80.0f);
+    float CpuUsage = FPlatformProcess::GetCPUUsage();
+    if (CpuUsage < 0.0f)
+    {
+        CpuUsage = 0.0f;
+    }
+    CurrentMetrics.CPUUsagePercent = FMath::Clamp(CpuUsage, 0.0f, 100.0f);
 }
 
 void UHSDedicatedServerManager::CollectMemoryMetrics()
 {
-    // 실제 구현에서는 실제 메모리 사용량 측정
-    CurrentMetrics.MemoryUsageMB = FMath::RandRange(1024.0f, 4096.0f);
+    const FPlatformMemoryStats MemoryStats = FPlatformMemory::GetStats();
+    CurrentMetrics.MemoryUsageMB = static_cast<float>(MemoryStats.UsedPhysical) / (1024.0f * 1024.0f);
 }
 
 void UHSDedicatedServerManager::CollectNetworkMetrics()
 {
-    // 실제 구현에서는 실제 네트워크 사용량 측정
-    CurrentMetrics.NetworkInKBps = FMath::RandRange(100.0f, 1000.0f);
-    CurrentMetrics.NetworkOutKBps = FMath::RandRange(200.0f, 1500.0f);
+    if (!GetWorld())
+    {
+        CurrentMetrics.NetworkInKBps = 0.0f;
+        CurrentMetrics.NetworkOutKBps = 0.0f;
+        return;
+    }
+
+    if (UNetDriver* NetDriver = GetWorld()->GetNetDriver())
+    {
+        const double CurrentTimeSeconds = FPlatformTime::Seconds();
+
+        if (LastNetworkSampleSeconds <= 0.0)
+        {
+            LastNetworkSampleSeconds = CurrentTimeSeconds;
+            LastRecordedInBytes = NetDriver->InBytes;
+            LastRecordedOutBytes = NetDriver->OutBytes;
+            CurrentMetrics.NetworkInKBps = 0.0f;
+            CurrentMetrics.NetworkOutKBps = 0.0f;
+            return;
+        }
+
+        const double DeltaSeconds = CurrentTimeSeconds - LastNetworkSampleSeconds;
+        if (DeltaSeconds <= KINDA_SMALL_NUMBER)
+        {
+            return;
+        }
+
+        const uint64 InDiff = NetDriver->InBytes - LastRecordedInBytes;
+        const uint64 OutDiff = NetDriver->OutBytes - LastRecordedOutBytes;
+
+        CurrentMetrics.NetworkInKBps = static_cast<float>((InDiff / 1024.0) / DeltaSeconds);
+        CurrentMetrics.NetworkOutKBps = static_cast<float>((OutDiff / 1024.0) / DeltaSeconds);
+
+        LastRecordedInBytes = NetDriver->InBytes;
+        LastRecordedOutBytes = NetDriver->OutBytes;
+        LastNetworkSampleSeconds = CurrentTimeSeconds;
+    }
+    else
+    {
+        CurrentMetrics.NetworkInKBps = 0.0f;
+        CurrentMetrics.NetworkOutKBps = 0.0f;
+    }
 }
 
 void UHSDedicatedServerManager::CollectGameplayMetrics()
 {
-    CurrentMetrics.ConnectedPlayers = GetConnectedPlayerCount();
-    CurrentMetrics.ActiveGameSessions = ActiveSessions.Num();
-    CurrentMetrics.TickRate = GetWorld() ? (1.0f / GetWorld()->GetDeltaSeconds()) : 60.0f;
-    CurrentMetrics.AverageLatency = FMath::RandRange(20.0f, 80.0f);
-    CurrentMetrics.PacketLossPercent = FMath::RandRange(0.0f, 2.0f);
+    double TotalLatency = 0.0;
+    int32 PlayerCount = 0;
+    {
+        FScopeLock PlayerLock(&PlayerMutex);
+        PlayerCount = ConnectedPlayers.Num();
+        for (const auto& PlayerPair : ConnectedPlayers)
+        {
+            TotalLatency += PlayerPair.Value.Ping;
+        }
+    }
+    CurrentMetrics.ConnectedPlayers = PlayerCount;
+
+    {
+        FScopeLock SessionLock(&SessionMutex);
+        CurrentMetrics.ActiveGameSessions = ActiveSessions.Num();
+    }
+    if (UWorld* World = GetWorld())
+    {
+        const float DeltaSeconds = World->GetDeltaSeconds();
+        CurrentMetrics.TickRate = DeltaSeconds > KINDA_SMALL_NUMBER ? (1.0f / DeltaSeconds) : 0.0f;
+    }
+    else
+    {
+        CurrentMetrics.TickRate = 0.0f;
+    }
+    CurrentMetrics.AverageLatency = PlayerCount > 0 ? static_cast<float>(TotalLatency / PlayerCount) : 0.0f;
+
+    float TotalPacketLossPercent = 0.0f;
+    int32 ConnectionCount = 0;
+    if (UWorld* World = GetWorld())
+    {
+        if (UNetDriver* NetDriver = World->GetNetDriver())
+        {
+            for (UNetConnection* Connection : NetDriver->ClientConnections)
+            {
+                if (!Connection)
+                {
+                    continue;
+                }
+
+                TotalPacketLossPercent += Connection->AvgLoss * 100.0f;
+                ++ConnectionCount;
+            }
+        }
+    }
+
+    CurrentMetrics.PacketLossPercent = ConnectionCount > 0 ? TotalPacketLossPercent / ConnectionCount : 0.0f;
 }
 
 void UHSDedicatedServerManager::ProcessAutoSessionCleanup()
@@ -927,10 +1113,112 @@ bool UHSDedicatedServerManager::ValidatePlayerAuthentication(const FString& Play
     {
         return false;
     }
-    
-    // 실제 구현에서는 외부 인증 서버와 통신
-    // 현재는 간단한 검증
-    return AuthToken.Len() >= 32; // 최소 32자 토큰
+
+    if (!ServerConfig)
+    {
+        UE_LOG(LogTemp, Warning, TEXT("HSDedicatedServerManager: 서버 설정이 없어 인증을 진행할 수 없습니다"));
+        return false;
+    }
+
+    const FHSSecurityConfig SecurityConfig = ServerConfig->GetSecurityConfig();
+
+    switch (SecurityConfig.AuthMethod)
+    {
+        case EHSAuthenticationMethod::None:
+            return true;
+
+        case EHSAuthenticationMethod::Basic:
+        {
+            FString DecodedToken;
+            if (!FBase64::Decode(AuthToken, DecodedToken))
+            {
+                UE_LOG(LogTemp, Warning, TEXT("HSDedicatedServerManager: Basic 토큰 디코딩 실패"));
+                return false;
+            }
+
+            TArray<FString> Segments;
+            DecodedToken.ParseIntoArray(Segments, TEXT(":"), true);
+            if (Segments.Num() < 2)
+            {
+                UE_LOG(LogTemp, Warning, TEXT("HSDedicatedServerManager: Basic 토큰 형식이 잘못되었습니다"));
+                return false;
+            }
+
+            if (!Segments[0].Equals(PlayerID, ESearchCase::IgnoreCase))
+            {
+                UE_LOG(LogTemp, Warning, TEXT("HSDedicatedServerManager: Basic 토큰 플레이어 ID 불일치"));
+                return false;
+            }
+
+            FString Signature = Segments.Last();
+            if (Signature.Len() < 8)
+            {
+                UE_LOG(LogTemp, Warning, TEXT("HSDedicatedServerManager: Basic 토큰 서명이 너무 짧습니다"));
+                return false;
+            }
+
+            if (Segments.Num() >= 3)
+            {
+                const int64 Timestamp = FCString::Atoi64(*Segments[1]);
+                if (Timestamp > 0)
+                {
+                    const FDateTime TokenTime = FDateTime::FromUnixTimestamp(Timestamp);
+                    if ((FDateTime::UtcNow() - TokenTime).GetTotalSeconds() > SecurityConfig.TokenValidityDuration)
+                    {
+                        UE_LOG(LogTemp, Warning, TEXT("HSDedicatedServerManager: Basic 토큰이 만료되었습니다"));
+                        return false;
+                    }
+                }
+            }
+
+            return true;
+        }
+
+        case EHSAuthenticationMethod::Token:
+        {
+            TSharedPtr<FJsonObject> Payload;
+            if (!ParseJwtPayload(AuthToken, Payload))
+            {
+                UE_LOG(LogTemp, Warning, TEXT("HSDedicatedServerManager: JWT 페이로드 파싱 실패"));
+                return false;
+            }
+
+            FString Subject;
+            Payload->TryGetStringField(TEXT("sub"), Subject);
+            if (Subject.IsEmpty())
+            {
+                Payload->TryGetStringField(TEXT("playerId"), Subject);
+            }
+
+            if (!Subject.Equals(PlayerID, ESearchCase::IgnoreCase))
+            {
+                UE_LOG(LogTemp, Warning, TEXT("HSDedicatedServerManager: JWT 플레이어 ID 불일치"));
+                return false;
+            }
+
+            double ExpirationSeconds = 0.0;
+            if (!Payload->TryGetNumberField(TEXT("exp"), ExpirationSeconds))
+            {
+                UE_LOG(LogTemp, Warning, TEXT("HSDedicatedServerManager: JWT 만료 정보 없음"));
+                return false;
+            }
+
+            const FDateTime ExpirationTime = FDateTime::FromUnixTimestamp(static_cast<int64>(ExpirationSeconds));
+            if (FDateTime::UtcNow() >= ExpirationTime)
+            {
+                UE_LOG(LogTemp, Warning, TEXT("HSDedicatedServerManager: JWT 토큰이 만료되었습니다"));
+                return false;
+            }
+
+            return true;
+        }
+
+        default:
+            UE_LOG(LogTemp, Warning, TEXT("HSDedicatedServerManager: 지원되지 않는 인증 방식입니다 - %d"), static_cast<int32>(SecurityConfig.AuthMethod));
+            break;
+    }
+
+    return false;
 }
 
 bool UHSDedicatedServerManager::ValidateSessionAccess(const FString& SessionID, const FString& PlayerID) const
@@ -948,8 +1236,22 @@ void UHSDedicatedServerManager::LogSecurityEvent(const FString& Event, const FSt
 {
     UE_LOG(LogTemp, Warning, TEXT("HSDedicatedServerManager: 보안 이벤트 - %s (플레이어: %s)"), 
            *Event, *PlayerID);
-    
-    // 실제 구현에서는 보안 로그 시스템에 기록
+
+    const FString LogDirectory = FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("Logs"));
+    IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
+    if (!PlatformFile.DirectoryExists(*LogDirectory))
+    {
+        PlatformFile.CreateDirectoryTree(*LogDirectory);
+    }
+
+    const FString LogFilePath = FPaths::Combine(LogDirectory, TEXT("SecurityEvents.log"));
+    const FString LogLine = FString::Printf(TEXT("%s | %s | Player: %s%s"),
+        *FDateTime::UtcNow().ToString(), *Event, *PlayerID, LINE_TERMINATOR);
+
+    if (!FFileHelper::SaveStringToFile(LogLine, *LogFilePath, FFileHelper::EEncodingOptions::AutoDetect, &PlatformFile, FILEWRITE_Append))
+    {
+        UE_LOG(LogTemp, Error, TEXT("HSDedicatedServerManager: 보안 이벤트 로그 기록 실패 - %s"), *LogFilePath);
+    }
 }
 
 bool UHSDedicatedServerManager::IsServerInitialized() const

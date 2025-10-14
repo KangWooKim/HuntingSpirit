@@ -1,9 +1,14 @@
 #include "HSMatchmakingSystem.h"
 #include "Engine/World.h"
 #include "Engine/GameInstance.h"
+#include "Engine/LocalPlayer.h"
 #include "TimerManager.h"
 #include "Kismet/GameplayStatics.h"
 #include "OnlineSubsystemUtils.h"
+#include "OnlineSessionNames.h"
+#include "Interfaces/OnlineIdentityInterface.h"
+#include "Internationalization/Internationalization.h"
+#include "Internationalization/Culture.h"
 
 UHSMatchmakingSystem::UHSMatchmakingSystem()
 {
@@ -14,6 +19,8 @@ UHSMatchmakingSystem::UHSMatchmakingSystem()
     CurrentSkillTolerance = SkillToleranceBase;
     CurrentMaxPing = 100;
     SessionSearch = nullptr;
+    bHasPendingSessionResult = false;
+    LastSearchRequestTime = 0.0f;
 }
 
 void UHSMatchmakingSystem::Initialize(FSubsystemCollectionBase& Collection)
@@ -62,6 +69,12 @@ void UHSMatchmakingSystem::Deinitialize()
 
 bool UHSMatchmakingSystem::StartMatchmaking(const FHSMatchmakingRequest& Request)
 {
+    EHSRegion ResolvedRegion = Request.PreferredRegion;
+    if (ResolvedRegion == EHSRegion::Auto)
+    {
+        ResolvedRegion = DetectOptimalRegion();
+    }
+
     FScopeLock Lock(&MatchmakingMutex);
     
     if (CurrentStatus == EHSMatchmakingStatus::Searching)
@@ -78,14 +91,13 @@ bool UHSMatchmakingSystem::StartMatchmaking(const FHSMatchmakingRequest& Request
     
     CurrentRequest = Request;
     SearchStartTime = GetWorld()->GetTimeSeconds();
+    LastSearchRequestTime = SearchStartTime;
     CurrentSkillTolerance = SkillToleranceBase;
     CurrentMaxPing = Request.MaxPing;
+    PendingSessionResult = FOnlineSessionSearchResult();
+    bHasPendingSessionResult = false;
     
-    // 지역 자동 감지
-    if (Request.PreferredRegion == EHSRegion::Auto)
-    {
-        CurrentRequest.PreferredRegion = DetectOptimalRegion();
-    }
+    CurrentRequest.PreferredRegion = ResolvedRegion;
     
     UE_LOG(LogTemp, Log, TEXT("HSMatchmakingSystem: 매치메이킹 시작 - 타입: %d, 지역: %d"), 
            (int32)Request.MatchType, (int32)CurrentRequest.PreferredRegion);
@@ -123,20 +135,14 @@ bool UHSMatchmakingSystem::StartMatchmaking(const FHSMatchmakingRequest& Request
         SessionSearch->QuerySettings.Set(FName("SEARCH_LOBBIES"), true, EOnlineComparisonOp::Equals);
         
         // 지역별 필터
-        FString RegionString = TEXT("Global");
-        switch (CurrentRequest.PreferredRegion)
-        {
-            case EHSRegion::NorthAmerica: RegionString = TEXT("NA"); break;
-            case EHSRegion::Europe: RegionString = TEXT("EU"); break;
-            case EHSRegion::Asia: RegionString = TEXT("AS"); break;
-            case EHSRegion::Oceania: RegionString = TEXT("OC"); break;
-            case EHSRegion::SouthAmerica: RegionString = TEXT("SA"); break;
-        }
+        FString RegionString = GetRegionTag(CurrentRequest.PreferredRegion);
         SessionSearch->QuerySettings.Set(FName("Region"), RegionString, EOnlineComparisonOp::Equals);
         
         // 세션 검색 델리게이트 바인딩
         SessionInterface->OnFindSessionsCompleteDelegates.AddUObject(
             this, &UHSMatchmakingSystem::HandleSessionSearchComplete);
+        SessionInterface->OnJoinSessionCompleteDelegates.AddUObject(
+            this, &UHSMatchmakingSystem::HandleJoinSessionComplete);
         
         if (!SessionInterface->FindSessions(0, SessionSearch.ToSharedRef()))
         {
@@ -197,15 +203,37 @@ bool UHSMatchmakingSystem::AcceptMatch(const FString& MatchID)
         GetWorld()->GetTimerManager().ClearTimer(MatchAcceptanceTimeoutHandle);
     }
     
-    // 세션 참가 처리 (실제 온라인 서브시스템 연동)
-    if (SessionInterface.IsValid())
+    if (!SessionInterface.IsValid())
     {
-        // 여기서 실제 세션 참가 로직 구현
-        // 현재는 시뮬레이션
-        // 매치 정보를 브로드캐스트하는 대신 상태만 업데이트
-        UpdateMatchmakingStatus(EHSMatchmakingStatus::InMatch);
+        HandleMatchmakingError(TEXT("세션 인터페이스가 유효하지 않습니다"));
+        return false;
     }
-    
+
+    if (!bHasPendingSessionResult)
+    {
+        HandleMatchmakingError(TEXT("참가할 세션 정보가 없습니다"));
+        return false;
+    }
+
+    const UGameInstance* GameInstance = GetWorld() ? GetWorld()->GetGameInstance() : nullptr;
+    const ULocalPlayer* LocalPlayer = GameInstance ? GameInstance->GetFirstGamePlayer() : nullptr;
+    if (!LocalPlayer || !LocalPlayer->GetPreferredUniqueNetId().IsValid())
+    {
+        HandleMatchmakingError(TEXT("로컬 플레이어 정보를 찾을 수 없습니다"));
+        return false;
+    }
+
+    const FOnlineSessionSearchResult SessionToJoin = PendingSessionResult;
+
+    if (!SessionInterface->JoinSession(*LocalPlayer->GetPreferredUniqueNetId(), NAME_GameSession, SessionToJoin))
+    {
+        HandleMatchmakingError(TEXT("세션 참가 요청이 실패했습니다"));
+        return false;
+    }
+
+    bHasPendingSessionResult = false;
+
+    // JoinSession 호출이 성공하면 OnJoinSessionComplete 델리게이트에서 최종 처리
     return true;
 }
 
@@ -220,6 +248,9 @@ void UHSMatchmakingSystem::DeclineMatch(const FString& MatchID)
     
     UE_LOG(LogTemp, Log, TEXT("HSMatchmakingSystem: 매치 거절 - ID: %s"), *MatchID);
     
+    bHasPendingSessionResult = false;
+    PendingSessionResult = FOnlineSessionSearchResult();
+
     // 매칭 재시작
     ResetMatchmakingState();
     
@@ -347,27 +378,25 @@ void UHSMatchmakingSystem::ProcessMatchmakingQueue()
         return;
     }
     
-    // 시뮬레이션: 일정 확률로 매치 발견
-    float MatchProbability = FMath::Min(ElapsedTime / 60.0f, 0.95f); // 시간이 지날수록 확률 증가
-    if (FMath::RandRange(0.0f, 1.0f) < MatchProbability * 0.1f) // 매 초마다 10% 확률
+    // 세션 검색이 완료되었으나 조건에 맞는 결과가 없으면 재검색 시도
+    if (SessionInterface.IsValid() && SessionSearch.IsValid() && GetWorld())
     {
-        // 가상 매치 생성
-        FHSMatchInfo MatchInfo;
-        MatchInfo.MatchID = GenerateMatchID();
-        MatchInfo.ServerAddress = TEXT("127.0.0.1:7777");
-        MatchInfo.CurrentPlayers = FMath::RandRange(1, 3);
-        MatchInfo.MaxPlayers = 4;
-        MatchInfo.PingMs = EstimatePingToRegion(CurrentRequest.PreferredRegion);
-        MatchInfo.Region = CurrentRequest.PreferredRegion;
-        MatchInfo.AverageSkillRating = PlayerInfo.SkillRating + FMath::RandRange(-200.0f, 200.0f);
-        
-        CurrentMatchID = MatchInfo.MatchID;
-        
-        UpdateMatchmakingStatus(EHSMatchmakingStatus::MatchFound);
-        OnMatchFound.Broadcast(MatchInfo);
-        
-        // 매치 수락 타임아웃 시작
-        OnMatchAcceptanceTimeout();
+        const float WorldTime = GetWorld()->GetTimeSeconds();
+        if (SessionSearch->SearchState == EOnlineAsyncTaskState::Done && !bHasPendingSessionResult)
+        {
+            if (SessionSearch->SearchResults.Num() == 0 && (WorldTime - LastSearchRequestTime) >= 10.0f)
+            {
+                const UGameInstance* GameInstance = GetWorld()->GetGameInstance();
+                const ULocalPlayer* LocalPlayer = GameInstance ? GameInstance->GetFirstGamePlayer() : nullptr;
+                if (LocalPlayer && LocalPlayer->GetPreferredUniqueNetId().IsValid())
+                {
+                    UE_LOG(LogTemp, Verbose, TEXT("HSMatchmakingSystem: 세션 재검색 시도"));
+                    SessionSearch->SearchResults.Empty();
+                    SessionInterface->FindSessions(*LocalPlayer->GetPreferredUniqueNetId(), SessionSearch.ToSharedRef());
+                    LastSearchRequestTime = WorldTime;
+                }
+            }
+        }
     }
 }
 
@@ -399,23 +428,95 @@ bool UHSMatchmakingSystem::IsSkillMatchSuitable(const FHSPlayerMatchmakingInfo& 
 
 EHSRegion UHSMatchmakingSystem::DetectOptimalRegion() const
 {
-    // 실제 구현에서는 IP 기반 지역 감지 또는 핑 테스트 수행
-    // 현재는 간단한 시뮬레이션
-    return EHSRegion::Asia; // 한국 기본값
+    if (PlayerInfo.Region != EHSRegion::Auto)
+    {
+        return PlayerInfo.Region;
+    }
+
+    {
+        FScopeLock Lock(&MatchmakingMutex);
+        EHSRegion BestRegion = EHSRegion::Asia;
+        int32 BestPing = MAX_int32;
+
+        for (const auto& Pair : RegionPingStats)
+        {
+            if (Pair.Value.SampleCount == 0)
+            {
+                continue;
+            }
+
+            const int32 AveragePing = Pair.Value.GetAverage();
+            if (AveragePing < BestPing)
+            {
+                BestPing = AveragePing;
+                BestRegion = Pair.Key;
+            }
+        }
+
+        if (BestPing != MAX_int32)
+        {
+            return BestRegion;
+        }
+    }
+
+    // 지역 정보가 없는 경우 시스템 로케일 기반으로 추정
+    const TSharedRef<const FCulture> Culture = FInternationalization::Get().GetCurrentCulture();
+    const FString CultureName = Culture->GetName(); // 예: ko-KR, en-US
+    FString RegionCode;
+    if (CultureName.Split(TEXT("-"), nullptr, &RegionCode))
+    {
+        return ParseRegionTag(RegionCode);
+    }
+
+    return EHSRegion::Asia;
 }
 
 int32 UHSMatchmakingSystem::EstimatePingToRegion(EHSRegion Region) const
 {
-    // 지역별 예상 핑 (한국 기준)
-    switch (Region)
+    if (Region == EHSRegion::Auto)
     {
-        case EHSRegion::Asia: return FMath::RandRange(10, 30);
-        case EHSRegion::NorthAmerica: return FMath::RandRange(150, 200);
-        case EHSRegion::Europe: return FMath::RandRange(250, 300);
-        case EHSRegion::Oceania: return FMath::RandRange(80, 120);
-        case EHSRegion::SouthAmerica: return FMath::RandRange(300, 350);
-        default: return FMath::RandRange(50, 100);
+        Region = DetectOptimalRegion();
     }
+
+    {
+        FScopeLock Lock(&MatchmakingMutex);
+        if (const FRegionPingStats* Stats = RegionPingStats.Find(Region))
+        {
+            const int32 Average = Stats->GetAverage();
+            if (Average != MAX_int32)
+            {
+                return Average;
+            }
+        }
+    }
+
+    if (SessionSearch.IsValid())
+    {
+        double TotalPing = 0.0;
+        int32 SampleCount = 0;
+        for (const FOnlineSessionSearchResult& SearchResult : SessionSearch->SearchResults)
+        {
+            FString RegionString;
+            EHSRegion ResultRegion = Region;
+            if (SearchResult.Session.SessionSettings.Get(FName("Region"), RegionString))
+            {
+                ResultRegion = ParseRegionTag(RegionString);
+            }
+
+            if (ResultRegion == Region)
+            {
+                TotalPing += SearchResult.PingInMs;
+                ++SampleCount;
+            }
+        }
+
+        if (SampleCount > 0)
+        {
+            return static_cast<int32>(TotalPing / SampleCount);
+        }
+    }
+
+    return CurrentRequest.MaxPing;
 }
 
 void UHSMatchmakingSystem::UpdateEstimatedWaitTime()
@@ -443,29 +544,109 @@ void UHSMatchmakingSystem::HandleSessionSearchComplete(bool bWasSuccessful)
     {
         return;
     }
+
+    FScopeLock Lock(&MatchmakingMutex);
     
-    if (bWasSuccessful && SessionSearch->SearchResults.Num() > 0)
+    if (!bWasSuccessful)
     {
-        UE_LOG(LogTemp, Log, TEXT("HSMatchmakingSystem: %d개 세션 발견"), SessionSearch->SearchResults.Num());
-        
-        // 최적 세션 선택 로직
-        for (const auto& SearchResult : SessionSearch->SearchResults)
+        UE_LOG(LogTemp, Error, TEXT("HSMatchmakingSystem: 세션 검색이 실패했습니다"));
+        return;
+    }
+
+    if (SessionSearch->SearchResults.Num() == 0)
+    {
+        UE_LOG(LogTemp, Warning, TEXT("HSMatchmakingSystem: 세션 검색 결과가 없습니다"));
+        ExpandSearchCriteria();
+        return;
+    }
+
+    const FOnlineSessionSearchResult* BestResult = nullptr;
+    EHSRegion BestRegion = EHSRegion::Auto;
+    int32 BestPing = MAX_int32;
+
+    for (const FOnlineSessionSearchResult& SearchResult : SessionSearch->SearchResults)
+    {
+        if (!SearchResult.IsValid())
         {
-            if (SearchResult.IsValid())
+            continue;
+        }
+
+        FString RegionString;
+        EHSRegion ResultRegion = EHSRegion::Auto;
+        if (SearchResult.Session.SessionSettings.Get(FName("Region"), RegionString))
+        {
+            ResultRegion = ParseRegionTag(RegionString);
+        }
+
+        RecordRegionPingSample(ResultRegion, SearchResult.PingInMs);
+
+        if (ResultRegion == EHSRegion::Auto)
+        {
+            if (CurrentRequest.PreferredRegion != EHSRegion::Auto)
             {
-                // 세션 정보 검증 및 매치 생성
-                // 실제 구현에서는 여기서 세션 참가 시도
+                ResultRegion = CurrentRequest.PreferredRegion;
+            }
+            else if (PlayerInfo.Region != EHSRegion::Auto)
+            {
+                ResultRegion = PlayerInfo.Region;
+            }
+            else
+            {
+                ResultRegion = EHSRegion::Asia;
             }
         }
+
+        if (CurrentRequest.PreferredRegion != EHSRegion::Auto && ResultRegion != CurrentRequest.PreferredRegion)
+        {
+            continue;
+        }
+
+        const int32 MaxConnections = SearchResult.Session.SessionSettings.NumPublicConnections + SearchResult.Session.SessionSettings.NumPrivateConnections;
+        const int32 OpenConnections = SearchResult.Session.NumOpenPublicConnections + SearchResult.Session.NumOpenPrivateConnections;
+        if (MaxConnections > 0 && OpenConnections <= 0)
+        {
+            continue;
+        }
+
+        if (SearchResult.PingInMs > CurrentMaxPing)
+        {
+            continue;
+        }
+
+        if (!BestResult || SearchResult.PingInMs < BestPing)
+        {
+            BestResult = &SearchResult;
+            BestRegion = ResultRegion;
+            BestPing = SearchResult.PingInMs;
+        }
+    }
+
+    if (BestResult)
+    {
+        PendingSessionResult = *BestResult;
+        bHasPendingSessionResult = true;
+        CurrentMatchID = BestResult->GetSessionIdStr();
+
+        FHSMatchInfo MatchInfo = BuildMatchInfoFromResult(*BestResult, BestRegion);
+        UpdateMatchmakingStatus(EHSMatchmakingStatus::MatchFound);
+        OnMatchFound.Broadcast(MatchInfo);
+        OnMatchAcceptanceTimeout();
+        
+        UE_LOG(LogTemp, Log, TEXT("HSMatchmakingSystem: 조건에 맞는 세션 발견 - ID: %s, 핑: %dms"),
+               *CurrentMatchID, MatchInfo.PingMs);
     }
     else
     {
-        UE_LOG(LogTemp, Warning, TEXT("HSMatchmakingSystem: 세션 검색 실패 또는 결과 없음"));
+        UE_LOG(LogTemp, Warning, TEXT("HSMatchmakingSystem: 조건에 맞는 세션을 찾지 못했습니다"));
+        ExpandSearchCriteria();
     }
 }
 
 void UHSMatchmakingSystem::HandleJoinSessionComplete(FName SessionName, bool bWasSuccessful)
 {
+    bHasPendingSessionResult = false;
+    PendingSessionResult = FOnlineSessionSearchResult();
+    
     if (bWasSuccessful)
     {
         UE_LOG(LogTemp, Log, TEXT("HSMatchmakingSystem: 세션 참가 성공: %s"), *SessionName.ToString());
@@ -482,10 +663,13 @@ void UHSMatchmakingSystem::ResetMatchmakingState()
 {
     CurrentMatchID.Empty();
     SearchStartTime = 0.0f;
+    LastSearchRequestTime = 0.0f;
     CurrentSkillTolerance = SkillToleranceBase;
     CurrentMaxPing = CurrentRequest.MaxPing;
     CachedWaitTime = 0.0f;
     WaitTimeCacheTimestamp = 0.0f;
+    bHasPendingSessionResult = false;
+    PendingSessionResult = FOnlineSessionSearchResult();
 }
 
 void UHSMatchmakingSystem::CleanupMatchmakingResources()
@@ -506,6 +690,117 @@ void UHSMatchmakingSystem::CleanupMatchmakingResources()
     }
     
     SessionSearch.Reset();
+    bHasPendingSessionResult = false;
+    PendingSessionResult = FOnlineSessionSearchResult();
+}
+
+FString UHSMatchmakingSystem::GetRegionTag(EHSRegion Region)
+{
+    switch (Region)
+    {
+        case EHSRegion::NorthAmerica: return TEXT("NA");
+        case EHSRegion::Europe: return TEXT("EU");
+        case EHSRegion::Asia: return TEXT("AS");
+        case EHSRegion::Oceania: return TEXT("OC");
+        case EHSRegion::SouthAmerica: return TEXT("SA");
+        default: return TEXT("Global");
+    }
+}
+
+EHSRegion UHSMatchmakingSystem::ParseRegionTag(const FString& RegionString)
+{
+    FString Normalized = RegionString.ToUpper();
+    Normalized.ReplaceInline(TEXT(" "), TEXT(""));
+
+    if (Normalized.IsEmpty() || Normalized == TEXT("GLOBAL") || Normalized == TEXT("AUTO"))
+    {
+        return EHSRegion::Auto;
+    }
+
+    if (Normalized == TEXT("NA") || Normalized == TEXT("NORTHAMERICA") || Normalized == TEXT("US") || Normalized == TEXT("USA") || Normalized == TEXT("CA") || Normalized == TEXT("CANADA"))
+    {
+        return EHSRegion::NorthAmerica;
+    }
+
+    if (Normalized == TEXT("EU") || Normalized == TEXT("EUROPE") || Normalized == TEXT("UK") || Normalized == TEXT("DE") || Normalized == TEXT("FR") || Normalized == TEXT("IT") || Normalized == TEXT("ES"))
+    {
+        return EHSRegion::Europe;
+    }
+
+    if (Normalized == TEXT("AS") || Normalized == TEXT("ASIA") || Normalized == TEXT("KR") || Normalized == TEXT("JPN") || Normalized == TEXT("JP") || Normalized == TEXT("CN") || Normalized == TEXT("SG"))
+    {
+        return EHSRegion::Asia;
+    }
+
+    if (Normalized == TEXT("OC") || Normalized == TEXT("OCEANIA") || Normalized == TEXT("AUS") || Normalized == TEXT("AU") || Normalized == TEXT("NZ"))
+    {
+        return EHSRegion::Oceania;
+    }
+
+    if (Normalized == TEXT("SA") || Normalized == TEXT("SOUTHAMERICA") || Normalized == TEXT("BR") || Normalized == TEXT("BRAZIL") || Normalized == TEXT("AR") || Normalized == TEXT("ARGENTINA") || Normalized == TEXT("CL"))
+    {
+        return EHSRegion::SouthAmerica;
+    }
+
+    return EHSRegion::Auto;
+}
+
+void UHSMatchmakingSystem::RecordRegionPingSample(EHSRegion Region, int32 Ping)
+{
+    if (Region == EHSRegion::Auto)
+    {
+        Region = (CurrentRequest.PreferredRegion != EHSRegion::Auto) ? CurrentRequest.PreferredRegion : EHSRegion::Asia;
+    }
+
+    FRegionPingStats& Stats = RegionPingStats.FindOrAdd(Region);
+    Stats.AddSample(Ping);
+}
+
+FHSMatchInfo UHSMatchmakingSystem::BuildMatchInfoFromResult(const FOnlineSessionSearchResult& SearchResult, EHSRegion Region) const
+{
+    FHSMatchInfo MatchInfo;
+    MatchInfo.MatchID = SearchResult.GetSessionIdStr();
+    
+    EHSRegion ResolvedRegion = Region;
+    if (ResolvedRegion == EHSRegion::Auto)
+    {
+        if (CurrentRequest.PreferredRegion != EHSRegion::Auto)
+        {
+            ResolvedRegion = CurrentRequest.PreferredRegion;
+        }
+        else if (PlayerInfo.Region != EHSRegion::Auto)
+        {
+            ResolvedRegion = PlayerInfo.Region;
+        }
+        else
+        {
+            ResolvedRegion = EHSRegion::Asia;
+        }
+    }
+    MatchInfo.Region = ResolvedRegion;
+    MatchInfo.PingMs = SearchResult.PingInMs;
+
+    const int32 MaxConnections = SearchResult.Session.SessionSettings.NumPublicConnections + SearchResult.Session.SessionSettings.NumPrivateConnections;
+    const int32 OpenConnections = SearchResult.Session.NumOpenPublicConnections + SearchResult.Session.NumOpenPrivateConnections;
+    MatchInfo.MaxPlayers = MaxConnections;
+    MatchInfo.CurrentPlayers = FMath::Clamp(MaxConnections - OpenConnections, 0, MaxConnections);
+
+    float AverageSkill = PlayerInfo.SkillRating;
+    SearchResult.Session.SessionSettings.Get(TEXT("AVERAGE_SKILL"), AverageSkill);
+    SearchResult.Session.SessionSettings.Get(TEXT("AVERAGE_SKILL_RATING"), AverageSkill);
+    MatchInfo.AverageSkillRating = AverageSkill;
+
+    FString ServerAddress;
+    if (SessionInterface.IsValid() && SessionInterface->GetResolvedConnectString(SearchResult, ServerAddress))
+    {
+        MatchInfo.ServerAddress = ServerAddress;
+    }
+    else
+    {
+        MatchInfo.ServerAddress = SearchResult.Session.OwningUserName;
+    }
+
+    return MatchInfo;
 }
 
 FString UHSMatchmakingSystem::GenerateMatchID() const

@@ -66,6 +66,18 @@ struct FHSReplicationPacket
     UPROPERTY(BlueprintReadOnly, Category = "Replication Packet")
     int32 DataSize;
 
+    // 압축 사용 여부
+    UPROPERTY(BlueprintReadOnly, Category = "Replication Packet")
+    bool bWasCompressed;
+
+    // 델타 압축 사용 여부
+    UPROPERTY(BlueprintReadOnly, Category = "Replication Packet")
+    bool bWasDeltaCompressed;
+
+    // 원본 데이터 크기
+    UPROPERTY(BlueprintReadOnly, Category = "Replication Packet")
+    int32 UncompressedSize;
+
     // 신뢰성 필요 여부
     UPROPERTY(BlueprintReadOnly, Category = "Replication Packet")
     bool bReliable;
@@ -82,6 +94,9 @@ struct FHSReplicationPacket
         Priority = EHSReplicationPriority::RP_Normal;
         Channel = EHSReplicationChannel::RC_Default;
         DataSize = 0;
+        bWasCompressed = false;
+        bWasDeltaCompressed = false;
+        UncompressedSize = 0;
         bReliable = true;
         bOrdered = true;
     }
@@ -197,6 +212,7 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FOnReplicationPacketReceived, const
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnReplicationStatsUpdated, const FHSReplicationStats&, Stats);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FOnBandwidthExceeded, EHSReplicationChannel, Channel, float, ExcessUsage);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FOnReplicationError, const FString&, ErrorMessage, int32, ErrorCode);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(FOnReplicationPayloadReady, const FHSReplicationPacket&, Packet, const TArray<uint8>&, Payload, bool, bWasDelta);
 
 /**
  * 사냥의 영혼 복제 컴포넌트
@@ -455,6 +471,9 @@ public:
     UPROPERTY(BlueprintAssignable, Category = "Replication Events")
     FOnReplicationError OnReplicationError;
 
+    UPROPERTY(BlueprintAssignable, Category = "Replication Events")
+    FOnReplicationPayloadReady OnReplicationPayloadReady;
+
 protected:
     // === 복제되는 변수들 ===
 
@@ -535,8 +554,13 @@ protected:
     TMap<EHSReplicationChannel, FHSReplicationStats> ChannelStats;
 
     // 패킷 큐 (배치 처리용)
-    UPROPERTY()
-    TArray<FHSReplicationPacket> PacketQueue;
+    struct FHSQueuedReplicationPacket
+    {
+        FHSReplicationPacket Packet;
+        TArray<uint8> Payload;
+    };
+
+    TArray<FHSQueuedReplicationPacket> PacketQueue;
 
     // 다음 패킷 ID
     int32 NextPacketID;
@@ -596,7 +620,7 @@ private:
     TArray<uint8> CompressData(const TArray<uint8>& Data) const;
 
     // 데이터 압축 해제
-    TArray<uint8> DecompressData(const TArray<uint8>& CompressedData) const;
+    TArray<uint8> DecompressData(const TArray<uint8>& CompressedData, int32 UncompressedSize) const;
 
     // 델타 압축 계산
     TArray<uint8> CalculateDelta(const TArray<uint8>& OldData, const TArray<uint8>& NewData) const;
@@ -621,6 +645,12 @@ private:
     // 서버에서 클라이언트로 데이터 전송
     UFUNCTION(NetMulticast, Unreliable)
     void MulticastReceiveData(const FHSReplicationPacket& Packet, const TArray<uint8>& Data);
+
+    UFUNCTION(Client, Reliable)
+    void ClientReceiveDataReliable(const FHSReplicationPacket& Packet, const TArray<uint8>& Data);
+
+    UFUNCTION(Client, Unreliable)
+    void ClientReceiveDataUnreliable(const FHSReplicationPacket& Packet, const TArray<uint8>& Data);
 
     // 클라이언트에서 서버로 응답 전송
     UFUNCTION(Server, Unreliable)
@@ -655,8 +685,17 @@ private:
     // 패킷 큐 최적화
     void OptimizePacketQueue();
 
-    // 이전 프레임 데이터 (델타 압축용)
-    TMap<EHSReplicationChannel, TArray<uint8>> PreviousFrameData;
+    // 델타/압축 복원을 위한 이전 데이터
+    TMap<EHSReplicationChannel, TArray<uint8>> LastCompressedFrameData;
+    TMap<EHSReplicationChannel, TArray<uint8>> LastRawFrameData;
+
+    bool PreparePayloadForTransmission(const TArray<uint8>& Data, EHSReplicationPriority Priority,
+        EHSReplicationChannel Channel, bool bReliable, bool bOrdered,
+        FHSReplicationPacket& OutPacket, TArray<uint8>& OutPayload);
+
+    void HandleIncomingPayload(const FHSReplicationPacket& Packet, const TArray<uint8>& Data);
+
+    bool DispatchPacketToClient(UNetConnection* TargetConnection, const FHSReplicationPacket& Packet, const TArray<uint8>& Payload);
 
     // 스레드 안전성을 위한 뮤텍스
     mutable FCriticalSection ReplicationMutex;

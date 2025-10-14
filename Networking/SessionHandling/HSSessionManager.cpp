@@ -6,11 +6,15 @@
 #include "Engine/World.h"
 #include "Engine/Engine.h"
 #include "Engine/LocalPlayer.h"
+#include "GameFramework/PlayerState.h"
+#include "Engine/NetDriver.h"
+#include "Engine/NetConnection.h"
 #include "TimerManager.h"
 #include "GameFramework/GameModeBase.h"
 #include "GameFramework/PlayerController.h"
 #include "Kismet/GameplayStatics.h"
 #include "OnlineSubsystemUtils.h"
+#include "Interfaces/OnlineIdentityInterface.h"
 
 // 우리 게임에서 사용할 세션 이름
 const FName HSGameSessionName = TEXT("HuntingSpiritGameSession");
@@ -38,6 +42,11 @@ UHSSessionManager::UHSSessionManager()
     CurrentSessionSearch = nullptr;
     CurrentReconnectAttempts = 0;
     bIsInitialized = false;
+    bPendingQuickMatchJoin = false;
+    bReconnectSearchPending = false;
+    PendingReconnectSessionName.Empty();
+    PendingReconnectSessionId.Empty();
+    LastSearchResultsTimestamp = FDateTime::MinValue();
 }
 
 // 초기화
@@ -362,9 +371,9 @@ bool UHSSessionManager::QuickMatch(const FHSSessionSearchFilter& SearchFilter)
         return false;
     }
 
-    // 검색 완료 시 자동으로 첫 번째 세션에 참여하도록 플래그 설정
-    // 실제 구현에서는 OnSessionSearchCompleted에서 처리
-    
+    PendingQuickMatchFilter = SearchFilter;
+    bPendingQuickMatchJoin = true;
+
     UE_LOG(LogTemp, Log, TEXT("HSSessionManager: 빠른 매칭 시작"));
     return true;
 }
@@ -503,10 +512,49 @@ bool UHSSessionManager::KickPlayer(const FString& PlayerName)
         return false;
     }
 
-    // 실제 구현에서는 해당 플레이어의 연결을 끊고 세션에서 제거
-    // UE5의 온라인 서브시스템을 통해 처리
-    
-    UE_LOG(LogTemp, Log, TEXT("HSSessionManager: 플레이어 추방 - %s"), *PlayerName);
+    FNamedOnlineSession* Session = SessionInterface->GetNamedSession(NAME_GameSession);
+    if (!Session)
+    {
+        return false;
+    }
+
+    const ULocalPlayer* LocalPlayer = GetGameInstance()->GetFirstGamePlayer();
+    if (!LocalPlayer || !LocalPlayer->GetPreferredUniqueNetId().IsValid())
+    {
+        return false;
+    }
+
+    IOnlineIdentityPtr IdentityInterface = OnlineSubsystem ? OnlineSubsystem->GetIdentityInterface() : nullptr;
+    TSharedPtr<const FUniqueNetId> TargetPlayerId;
+
+    for (const TSharedRef<const FUniqueNetId>& RegisteredPlayer : Session->RegisteredPlayers)
+    {
+        FString RegisteredName = IdentityInterface.IsValid() ? IdentityInterface->GetPlayerNickname(*RegisteredPlayer) : FString();
+        if (RegisteredName.IsEmpty())
+        {
+            RegisteredName = RegisteredPlayer->ToString();
+        }
+
+        if (RegisteredName.Equals(PlayerName, ESearchCase::IgnoreCase))
+        {
+            TargetPlayerId = RegisteredPlayer;
+            break;
+        }
+    }
+
+    if (!TargetPlayerId.IsValid())
+    {
+        UE_LOG(LogTemp, Warning, TEXT("HSSessionManager: 추방할 플레이어를 찾을 수 없습니다 - %s"), *PlayerName);
+        return false;
+    }
+
+    if (!SessionInterface->KickPlayer(*LocalPlayer->GetPreferredUniqueNetId(), NAME_GameSession, *TargetPlayerId))
+    {
+        UE_LOG(LogTemp, Warning, TEXT("HSSessionManager: 플레이어 추방 실패 - %s"), *PlayerName);
+        return false;
+    }
+
+    UE_LOG(LogTemp, Log, TEXT("HSSessionManager: 플레이어 추방 성공 - %s"), *PlayerName);
     return true;
 }
 
@@ -523,6 +571,7 @@ bool UHSSessionManager::BanPlayer(const FString& PlayerName)
     {
         BannedPlayers.Add(PlayerName);
     }
+    BannedPlayerTimestamps.Add(PlayerName, FDateTime::UtcNow());
 
     // 현재 세션에 있다면 추방
     KickPlayer(PlayerName);
@@ -547,15 +596,17 @@ TArray<FString> UHSSessionManager::GetSessionPlayerNames() const
         return PlayerNames;
     }
 
-    // UE5에서는 세션 설정의 연결 정보로 플레이어 수를 계산
-    int32 MaxConnections = Session->SessionSettings.NumPublicConnections + Session->SessionSettings.NumPrivateConnections;
-    int32 OpenConnections = Session->NumOpenPublicConnections + Session->NumOpenPrivateConnections;
-    int32 NumPlayers = FMath::Max(0, MaxConnections - OpenConnections);
-    
-    for (int32 i = 0; i < NumPlayers; ++i)
+    IOnlineIdentityPtr IdentityInterface = OnlineSubsystem ? OnlineSubsystem->GetIdentityInterface() : nullptr;
+
+    for (const TSharedRef<const FUniqueNetId>& RegisteredPlayer : Session->RegisteredPlayers)
     {
-        // 실제 구현에서는 더 정확한 플레이어 정보 수집 필요
-        PlayerNames.Add(FString::Printf(TEXT("Player_%d"), i + 1));
+        FString DisplayName = IdentityInterface.IsValid() ? IdentityInterface->GetPlayerNickname(*RegisteredPlayer) : FString();
+        if (DisplayName.IsEmpty())
+        {
+            DisplayName = RegisteredPlayer->ToString();
+        }
+
+        PlayerNames.Add(DisplayName);
     }
 
     return PlayerNames;
@@ -594,8 +645,53 @@ int32 UHSSessionManager::GetSessionPing() const
         return 999;
     }
 
-    // 실제 구현에서는 네트워크 상태를 통해 핑을 계산
-    // 여기서는 간소화된 구현
+    if (UWorld* World = GetWorld())
+    {
+        if (APlayerController* PlayerController = World->GetFirstPlayerController())
+        {
+            if (APlayerState* PlayerState = PlayerController->PlayerState)
+            {
+                const float PingMs = PlayerState->GetPingInMilliseconds();
+                if (PingMs > 0.0f)
+                {
+                    return FMath::RoundToInt(PingMs);
+                }
+            }
+        }
+
+        if (UNetDriver* NetDriver = World->GetNetDriver())
+        {
+            if (NetDriver->ServerConnection)
+            {
+                const float AverageLag = NetDriver->ServerConnection->AvgLag;
+                if (AverageLag > 0.0f)
+                {
+                    return FMath::RoundToInt(AverageLag * 1000.0f);
+                }
+            }
+            else if (NetDriver->ClientConnections.Num() > 0)
+            {
+                double TotalPing = 0.0;
+                int32 ConnectionCount = 0;
+                for (UNetConnection* Connection : NetDriver->ClientConnections)
+                {
+                    if (!Connection)
+                    {
+                        continue;
+                    }
+
+                    TotalPing += Connection->AvgLag * 1000.0f;
+                    ++ConnectionCount;
+                }
+
+                if (ConnectionCount > 0)
+                {
+                    return FMath::RoundToInt(TotalPing / ConnectionCount);
+                }
+            }
+        }
+    }
+
     return CurrentSessionInfo.Ping;
 }
 
@@ -789,7 +885,8 @@ FHSSessionInfo UHSSessionManager::ConvertFromSearchResult(const FOnlineSessionSe
     SessionInfo.CurrentPlayers = FMath::Max(0, UsedConnections);
     SessionInfo.MaxPlayers = MaxConnections;
     SessionInfo.Ping = SearchResult.PingInMs;
-    SessionInfo.SearchResult = MakeShareable(&SearchResult);
+    TSharedPtr<FOnlineSessionSearchResult> SearchResultCopy = MakeShared<FOnlineSessionSearchResult>(SearchResult);
+    SessionInfo.SearchResult = SearchResultCopy;
 
     // 세션 설정에서 정보 추출
     FString SessionName, MapName, GameMode;
@@ -815,8 +912,20 @@ FHSSessionInfo UHSSessionManager::ConvertFromSearchResult(const FOnlineSessionSe
         SessionInfo.SessionType = (EHSSessionType)SessionTypeInt;
     }
 
-    // 호스트 이름 (실제 구현에서는 OwningUserId를 통해 조회)
-    SessionInfo.HostName = TEXT("Unknown Host");
+    // 호스트 이름 조회
+    FString HostName = SearchResult.Session.OwningUserName;
+    if (HostName.IsEmpty() && SearchResult.Session.OwningUserId.IsValid())
+    {
+        IOnlineIdentityPtr IdentityInterface = OnlineSubsystem ? OnlineSubsystem->GetIdentityInterface() : nullptr;
+        if (IdentityInterface.IsValid())
+        {
+            HostName = IdentityInterface->GetPlayerNickname(*SearchResult.Session.OwningUserId);
+        }
+    }
+    if (!HostName.IsEmpty())
+    {
+        SessionInfo.HostName = HostName;
+    }
 
     // 세션 설정 저장
     for (const auto& Setting : SearchResult.Session.SessionSettings.Settings)
@@ -860,10 +969,37 @@ void UHSSessionManager::AttemptReconnect()
     }
 
     CurrentReconnectAttempts++;
-    
-    // 간단한 재연결 로직 (실제 구현에서는 마지막 세션 정보를 사용)
-    UE_LOG(LogTemp, Log, TEXT("HSSessionManager: 재연결 시도 %d/%d"), 
-           CurrentReconnectAttempts, MaxReconnectRetries);
+
+    if (CurrentSessionInfo.SearchResult.IsValid())
+    {
+        UE_LOG(LogTemp, Log, TEXT("HSSessionManager: 기존 세션 정보로 재연결 시도 (%s)"), *CurrentSessionInfo.SessionName);
+        JoinSession(CurrentSessionInfo);
+        return;
+    }
+
+    if (!SessionInterface.IsValid())
+    {
+        HandleSessionError(TEXT("Session interface not available for reconnection"));
+        return;
+    }
+
+    bReconnectSearchPending = true;
+    PendingReconnectSessionName = CurrentSessionInfo.SessionName;
+    PendingReconnectSessionId = CurrentSessionInfo.SessionSettings.FindRef(TEXT("SESSION_ID"));
+
+    FHSSessionSearchFilter ReconnectFilter = DefaultSearchFilter;
+    ReconnectFilter.MaxSearchResults = FMath::Max(10, DefaultSearchFilter.MaxSearchResults);
+    ReconnectFilter.GameMode = CurrentSessionInfo.GameMode;
+    ReconnectFilter.MapName = CurrentSessionInfo.MapName;
+
+    if (!SearchSessions(ReconnectFilter))
+    {
+        bReconnectSearchPending = false;
+        HandleSessionError(TEXT("Failed to start reconnection search"));
+        return;
+    }
+
+    UE_LOG(LogTemp, Log, TEXT("HSSessionManager: 재연결을 위한 세션 검색 진행 (%s)"), *PendingReconnectSessionName);
 }
 
 // 연결 타임아웃 처리
@@ -880,11 +1016,26 @@ void UHSSessionManager::HandleConnectionTimeout()
 // 세션 정리
 void UHSSessionManager::CleanupSession()
 {
-    // 오래된 검색 결과 제거
-    LastSearchResults.Empty();
-    
-    // 금지된 플레이어 목록 정리 (예: 24시간 후 자동 해제)
-    // 실제 구현에서는 시간 기반 정리 로직 필요
+    const FDateTime Now = FDateTime::UtcNow();
+
+    if (LastSearchResults.Num() > 0 && (Now - LastSearchResultsTimestamp).GetTotalSeconds() > SearchResultRetentionSeconds)
+    {
+        LastSearchResults.Empty();
+        LastSearchResultsTimestamp = FDateTime::MinValue();
+        UE_LOG(LogTemp, Verbose, TEXT("HSSessionManager: 오래된 세션 검색 결과 정리"));
+    }
+
+    if (BannedPlayerTimestamps.Num() > 0)
+    {
+        for (auto It = BannedPlayerTimestamps.CreateIterator(); It; ++It)
+        {
+            if ((Now - It.Value()).GetTotalHours() >= BanRetentionHours)
+            {
+                BannedPlayers.Remove(It.Key());
+                It.RemoveCurrent();
+            }
+        }
+    }
 }
 
 // === 온라인 서브시스템 콜백 함수들 ===
@@ -941,17 +1092,97 @@ void UHSSessionManager::OnFindSessionsComplete(bool bSuccess)
             FHSSessionInfo SessionInfo = ConvertFromSearchResult(SearchResult);
             LastSearchResults.Add(SessionInfo);
         }
+        LastSearchResultsTimestamp = FDateTime::UtcNow();
         
         ChangeSessionState(EHSSessionState::SS_None);
         OnSessionSearchCompleted.Broadcast(true, LastSearchResults);
         
         UE_LOG(LogTemp, Log, TEXT("HSSessionManager: 세션 검색 완료 - %d개 발견"), LastSearchResults.Num());
+
+        if (bPendingQuickMatchJoin)
+        {
+            const FHSSessionInfo* BestSession = nullptr;
+            int32 BestPing = TNumericLimits<int32>::Max();
+
+            for (const FHSSessionInfo& SessionInfo : LastSearchResults)
+            {
+                if (!SessionInfo.SearchResult.IsValid())
+                {
+                    continue;
+                }
+
+                if (SessionInfo.MaxPlayers > 0 && SessionInfo.CurrentPlayers >= SessionInfo.MaxPlayers)
+                {
+                    continue;
+                }
+
+                if (PendingQuickMatchFilter.MaxPing > 0 && SessionInfo.Ping > PendingQuickMatchFilter.MaxPing)
+                {
+                    continue;
+                }
+
+                if (!BestSession || SessionInfo.Ping < BestPing)
+                {
+                    BestSession = &SessionInfo;
+                    BestPing = SessionInfo.Ping;
+                }
+            }
+
+            bPendingQuickMatchJoin = false;
+
+            if (BestSession)
+            {
+                UE_LOG(LogTemp, Log, TEXT("HSSessionManager: 빠른 매칭 대상 세션 선택 - %s (핑: %d)"), *BestSession->SessionName, BestSession->Ping);
+                JoinSession(*BestSession);
+                return;
+            }
+            else
+            {
+                UE_LOG(LogTemp, Warning, TEXT("HSSessionManager: 빠른 매칭 조건에 맞는 세션이 없습니다"));
+            }
+        }
+
+        if (bReconnectSearchPending)
+        {
+            const FHSSessionInfo* TargetSession = nullptr;
+            for (const FHSSessionInfo& SessionInfo : LastSearchResults)
+            {
+                if (!SessionInfo.SearchResult.IsValid())
+                {
+                    continue;
+                }
+
+                const FString* SessionIdSetting = SessionInfo.SessionSettings.Find(TEXT("SESSION_ID"));
+                const bool bIdMatches = SessionIdSetting && !PendingReconnectSessionId.IsEmpty() && SessionIdSetting->Equals(PendingReconnectSessionId, ESearchCase::IgnoreCase);
+                const bool bNameMatches = SessionInfo.SessionName.Equals(PendingReconnectSessionName, ESearchCase::IgnoreCase);
+
+                if (bIdMatches || bNameMatches)
+                {
+                    TargetSession = &SessionInfo;
+                    break;
+                }
+            }
+
+            if (TargetSession)
+            {
+                UE_LOG(LogTemp, Log, TEXT("HSSessionManager: 재연결 대상 세션 발견 - %s"), *TargetSession->SessionName);
+                bReconnectSearchPending = false;
+                JoinSession(*TargetSession);
+                return;
+            }
+            else
+            {
+                UE_LOG(LogTemp, Warning, TEXT("HSSessionManager: 재연결 대상 세션을 찾지 못했습니다"));
+            }
+        }
     }
     else
     {
         ChangeSessionState(EHSSessionState::SS_Error);
         OnSessionSearchCompleted.Broadcast(false, TArray<FHSSessionInfo>());
         UE_LOG(LogTemp, Error, TEXT("HSSessionManager: 세션 검색 실패"));
+        bPendingQuickMatchJoin = false;
+        bReconnectSearchPending = false;
     }
 }
 

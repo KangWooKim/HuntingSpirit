@@ -555,6 +555,22 @@ protected:
     // 금지된 플레이어 목록
     UPROPERTY()
     TArray<FString> BannedPlayers;
+    
+    // 퀵 매치 자동 참여 상태
+    bool bPendingQuickMatchJoin;
+    FHSSessionSearchFilter PendingQuickMatchFilter;
+    
+    // 재연결 검색 상태
+    bool bReconnectSearchPending;
+    FString PendingReconnectSessionName;
+    FString PendingReconnectSessionId;
+    
+    // 최근 검색 결과 타임스탬프
+    FDateTime LastSearchResultsTimestamp;
+
+    // 금지된 플레이어 유효 기간 추적
+    UPROPERTY()
+    TMap<FString, FDateTime> BannedPlayerTimestamps;
 
     // === 타이머 핸들들 ===
 
@@ -571,6 +587,10 @@ protected:
     FTimerHandle SessionCleanupTimer;
 
 private:
+    // === 상수 설정 ===
+    static constexpr float BanRetentionHours = 24.0f;
+    static constexpr float SearchResultRetentionSeconds = 120.0f;
+
     // === 내부 함수들 ===
 
     // 온라인 서브시스템 초기화

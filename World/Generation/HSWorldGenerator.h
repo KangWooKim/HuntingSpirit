@@ -4,12 +4,27 @@
 #include "CoreMinimal.h"
 #include "GameFramework/Actor.h"
 #include "Engine/DataTable.h"
+#include "UObject/ObjectPtr.h"
 #include "HSBiomeData.h"
 #include "HSWorldGenerator.generated.h"
 
 // Forward declarations
 class UProceduralMeshComponent;
 class UHierarchicalInstancedStaticMeshComponent;
+class UPrimitiveComponent;
+class USceneComponent;
+
+USTRUCT(BlueprintType)
+struct FChunkInstancedMeshEntry
+{
+    GENERATED_BODY()
+
+    UPROPERTY(BlueprintReadWrite)
+    TObjectPtr<UHierarchicalInstancedStaticMeshComponent> Component;
+
+    UPROPERTY(BlueprintReadWrite)
+    TArray<int32> InstanceIndices;
+};
 
 /**
  * 월드 청크 정보를 담는 구조체
@@ -27,6 +42,12 @@ struct FWorldChunk
 
     UPROPERTY(BlueprintReadWrite)
     TArray<AActor*> SpawnedActors;
+
+    UPROPERTY(BlueprintReadWrite)
+    TArray<TObjectPtr<UPrimitiveComponent>> SpawnedComponents;
+
+    UPROPERTY(BlueprintReadWrite)
+    TArray<FChunkInstancedMeshEntry> InstancedMeshEntries;
 
     UPROPERTY(BlueprintReadWrite)
     bool bIsGenerated;
@@ -225,10 +246,11 @@ protected:
 
     /**
      * 인스턴스 메시로 오브젝트 스폰 (최적화)
+     * @param Chunk 대상 청크
      * @param StaticMesh 스태틱 메시
      * @param Transform 트랜스폼
      */
-    void SpawnInstancedMesh(UStaticMesh* StaticMesh, const FTransform& Transform);
+    void SpawnInstancedMesh(FWorldChunk& Chunk, UStaticMesh* StaticMesh, const FTransform& Transform);
 
     /**
      * 청크 간 경계 부드럽게 처리

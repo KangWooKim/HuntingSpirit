@@ -372,6 +372,9 @@ protected:
     mutable TMap<FString, FHSGameSessionInfo> SessionInfoCache;
     mutable TMap<FString, FHSPlayerConnectionInfo> PlayerInfoCache;
     mutable float LastMetricsUpdateTime;
+    mutable uint64 LastRecordedInBytes = 0;
+    mutable uint64 LastRecordedOutBytes = 0;
+    mutable double LastNetworkSampleSeconds = 0.0;
     
     // === 오브젝트 풀링 ===
     TArray<FHSGameSessionInfo> SessionPool;

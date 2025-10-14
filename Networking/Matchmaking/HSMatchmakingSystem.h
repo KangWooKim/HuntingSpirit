@@ -268,15 +268,43 @@ private:
     IOnlineSessionPtr SessionInterface;
     TSharedPtr<FOnlineSessionSearch> SessionSearch;
     
+    struct FRegionPingStats
+    {
+        int32 SampleCount = 0;
+        double TotalPing = 0.0;
+        int32 LowestPing = MAX_int32;
+
+        void AddSample(int32 Ping)
+        {
+            ++SampleCount;
+            TotalPing += Ping;
+            LowestPing = FMath::Min(LowestPing, Ping);
+        }
+
+        int32 GetAverage() const
+        {
+            return SampleCount > 0 ? static_cast<int32>(TotalPing / SampleCount) : MAX_int32;
+        }
+    };
+
+    mutable TMap<EHSRegion, FRegionPingStats> RegionPingStats;
+    FOnlineSessionSearchResult PendingSessionResult;
+    bool bHasPendingSessionResult = false;
+    
     // 매치 수락 타임아웃
     FTimerHandle MatchAcceptanceTimeoutHandle;
     
     // 지능형 매칭 알고리즘 상태
     float SearchStartTime;
+    float LastSearchRequestTime;
     float CurrentSkillTolerance;
     int32 CurrentMaxPing;
     
     // 내부 유틸리티 함수
+    static FString GetRegionTag(EHSRegion Region);
+    static EHSRegion ParseRegionTag(const FString& RegionString);
+    void RecordRegionPingSample(EHSRegion Region, int32 Ping);
+    FHSMatchInfo BuildMatchInfoFromResult(const FOnlineSessionSearchResult& SearchResult, EHSRegion Region) const;
     void ResetMatchmakingState();
     void CleanupMatchmakingResources();
     FString GenerateMatchID() const;

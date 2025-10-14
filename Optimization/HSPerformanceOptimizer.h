@@ -183,6 +183,16 @@ public:
     int32 GetActiveCount() const;
 
     /**
+     * 풀에서 지원하는 최대 용량 반환
+     */
+    FORCEINLINE int32 GetMaxPoolSize() const { return MaxPoolSize; }
+
+    /**
+     * 현재까지 실제로 생성된 오브젝트 수 반환
+     */
+    FORCEINLINE int32 GetCurrentPoolSize() const { return CurrentPoolSize; }
+
+    /**
      * 풀 크기 조정
      */
     void ResizePool(int32 NewMaxSize);
