@@ -38,9 +38,17 @@ struct HUNTINGSPIRIT_API FBuffData
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Buff")
     EBuffType BuffType = EBuffType::None;
     
-    // 버프 값
+    // 버프 값 (호환성 유지용)
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Buff")
     float Value = 0.0f;
+
+    // 고정 보너스 (스택당 적용)
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Buff")
+    float FlatValuePerStack = 0.0f;
+
+    // 퍼센트 보너스 (스택당 적용, 0.1 = +10%)
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Buff")
+    float PercentValuePerStack = 0.0f;
     
     // 지속 시간
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Buff")
@@ -62,16 +70,28 @@ struct HUNTINGSPIRIT_API FBuffData
     UPROPERTY(BlueprintReadOnly, Category = "Buff")
     float RemainingTime = 0.0f;
     
+    // 누적 적용된 고정 보너스
+    UPROPERTY(BlueprintReadOnly, Category = "Buff")
+    float AppliedFlatTotal = 0.0f;
+
+    // 누적 적용된 퍼센트 보너스
+    UPROPERTY(BlueprintReadOnly, Category = "Buff")
+    float AppliedPercentTotal = 0.0f;
+
     FBuffData()
     {
         BuffID = TEXT("");
         BuffType = EBuffType::None;
         Value = 0.0f;
+        FlatValuePerStack = 0.0f;
+        PercentValuePerStack = 0.0f;
         Duration = 0.0f;
         bIsPercentage = false;
         bStackable = false;
         CurrentStacks = 1;
         RemainingTime = 0.0f;
+        AppliedFlatTotal = 0.0f;
+        AppliedPercentTotal = 0.0f;
     }
 };
 
@@ -252,6 +272,16 @@ protected:
 private:
 	/** 자동 회복 타이머 핸들 */
 	FTimerHandle RegenerationTimerHandle;
+
+	struct FBuffStatAccumulator
+	{
+		float FlatBonus = 0.0f;
+		float PercentBonus = 0.0f;
+	};
+
+	TMap<EBuffType, FBuffStatAccumulator> BuffAccumulators;
+	TMap<EBuffType, float> BaseAttributeValues;
+	static constexpr int32 MaxBuffStackCount = 10;
 	
 	/** 자동 회복 처리 */
 	void HandleRegeneration();
@@ -269,5 +299,14 @@ private:
 	void InitializeMageStats();
 	
 	/** 버프 효과 적용/제거 */
-	void ApplyBuffEffect(const FBuffData& BuffData, bool bApply);
+	void ApplyBuffStacks(FBuffData& BuffData, int32 StackDelta);
+	void ApplyAllStatsDelta(FBuffData& BuffData, int32 StackDelta);
+	void UpdateStatAccumulator(EBuffType BuffType, bool bIsPercentage, float DeltaValue);
+	void RecalculateAttributeFromAccumulator(EBuffType BuffType);
+	void EnsureBaseAttributeCached(EBuffType BuffType);
+	float ExtractCurrentAttributeValue(EBuffType BuffType) const;
+	void RefreshBaseAttributes();
+	void CleanupAccumulatorIfNeutral(EBuffType BuffType);
+	float GetFlatValuePerStack(const FBuffData& BuffData) const;
+	float GetPercentValuePerStack(const FBuffData& BuffData) const;
 };

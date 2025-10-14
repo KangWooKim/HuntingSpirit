@@ -6,6 +6,7 @@
 #include "Kismet/GameplayStatics.h"
 #include "HAL/PlatformFilemanager.h"
 #include "Misc/DateTime.h"
+#include "UObject/StrongObjectPtr.h"
 #include "HSSaveGameData.h"
 #include "HSSaveGameManager.generated.h"
 
@@ -430,16 +431,28 @@ protected:
     struct FAsyncSaveTask
     {
         int32 SlotIndex;
-        TObjectPtr<UHSSaveGameData> SaveData;
+        TStrongObjectPtr<UHSSaveGameData> SaveData;
         float StartTime;
         
-        FAsyncSaveTask() : SlotIndex(0), SaveData(nullptr), StartTime(0.0f) {}
+        FAsyncSaveTask()
+            : SlotIndex(0)
+            , SaveData(nullptr)
+            , StartTime(0.0f)
+        {
+        }
+
         FAsyncSaveTask(int32 InSlotIndex, UHSSaveGameData* InSaveData, float InStartTime)
-            : SlotIndex(InSlotIndex), SaveData(InSaveData), StartTime(InStartTime) {}
+            : SlotIndex(InSlotIndex)
+            , SaveData(InSaveData)
+            , StartTime(InStartTime)
+        {
+        }
     };
     
     TQueue<FAsyncSaveTask> PendingSaveTasks;
     bool bAsyncTaskInProgress;
+    TStrongObjectPtr<UHSSaveGameData> ActiveSaveData;
+    float CurrentOperationStartTime;
     
     // 오브젝트 풀링 (성능 최적화)
     TArray<TArray<uint8>> DataBufferPool;

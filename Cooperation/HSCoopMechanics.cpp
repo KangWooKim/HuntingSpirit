@@ -493,17 +493,18 @@ bool UHSCoopMechanics::TriggerComboStep(const FName& ComboID, const FName& Actio
         OnComboChainCompleted.Broadcast(ComboID, ComboData->CompletionBonus);
         
         // 완성 보너스 적용
-        if (UHSStatsComponent* StatsComp = Player->FindComponentByClass<UHSStatsComponent>())
-        {
-            // 임시 데미지 버프 적용
-            FBuffData ComboBuffData;
-            ComboBuffData.BuffID = FString::Printf(TEXT("ComboBonus_%s"), *ComboID.ToString());
-            ComboBuffData.BuffType = EBuffType::Attack;
-            ComboBuffData.Value = ComboData->CompletionBonus - 1.0f; // 1.5배 보너스는 0.5f 추가
-            ComboBuffData.Duration = 10.0f;
-            ComboBuffData.bIsPercentage = true;
-            StatsComp->ApplyBuff(ComboBuffData);
-        }
+		if (UHSStatsComponent* StatsComp = Player->FindComponentByClass<UHSStatsComponent>())
+		{
+			// 임시 데미지 버프 적용
+			FBuffData ComboBuffData;
+			ComboBuffData.BuffID = FString::Printf(TEXT("ComboBonus_%s"), *ComboID.ToString());
+			ComboBuffData.BuffType = EBuffType::Attack;
+			ComboBuffData.Value = ComboData->CompletionBonus - 1.0f; // Legacy 지원용
+			ComboBuffData.PercentValuePerStack = ComboData->CompletionBonus - 1.0f;
+			ComboBuffData.Duration = 10.0f;
+			ComboBuffData.bIsPercentage = true;
+			StatsComp->ApplyBuff(ComboBuffData);
+		}
 
         // 콤보 리셋
         ResetComboChain(ComboID);

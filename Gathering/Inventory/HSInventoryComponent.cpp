@@ -4,10 +4,6 @@
 #include "TimerManager.h"
 #include "Net/UnrealNetwork.h"
 
-// 정적 멤버 초기화 (오브젝트 풀링)
-TArray<FHSInventorySlot> UHSInventoryComponent::SlotPool;
-int32 UHSInventoryComponent::PoolIndex = 0;
-
 bool FHSInventorySlot::CanStack(UHSItemInstance* InItem) const
 {
     if (!Item || !InItem || bIsEmpty || bIsLocked)
@@ -43,6 +39,22 @@ void FHSInventorySlot::Clear()
     bIsLocked = false;
 }
 
+void FHSInventorySlotFastArray::SyncFromLegacyArray(const TArray<FHSInventorySlot>& SourceSlots, bool bMarkDirty)
+{
+    Items.Reset(SourceSlots.Num());
+    for (int32 Index = 0; Index < SourceSlots.Num(); ++Index)
+    {
+        FHSInventorySlotFastArrayItem& NewItem = Items.AddDefaulted_GetRef();
+        NewItem.SlotIndex = Index;
+        NewItem.Slot = SourceSlots[Index];
+    }
+
+    if (bMarkDirty)
+    {
+        MarkArrayDirty();
+    }
+}
+
 UHSInventoryComponent::UHSInventoryComponent()
 {
     PrimaryComponentTick.bCanEverTick = false;
@@ -61,15 +73,7 @@ UHSInventoryComponent::UHSInventoryComponent()
         InventorySlots[i] = FHSInventorySlot();
     }
 
-    // 오브젝트 풀 초기화
-    if (SlotPool.Num() == 0)
-    {
-        SlotPool.Reserve(1000); // 1000개 슬롯 미리 할당
-        for (int32 i = 0; i < 1000; ++i)
-        {
-            SlotPool.Add(FHSInventorySlot());
-        }
-    }
+    ReplicatedFastSlots.SyncFromLegacyArray(InventorySlots, /*bMarkDirty=*/false);
 }
 
 void UHSInventoryComponent::BeginPlay()
@@ -79,6 +83,7 @@ void UHSInventoryComponent::BeginPlay()
     // 캐시 초기화
     UpdateItemCache();
     UpdateEmptySlotCache();
+    SyncFastArrayState();
 
     // 네트워크 최적화 타이머 설정
     if (GetOwner() && GetOwner()->HasAuthority())
@@ -249,8 +254,8 @@ bool UHSInventoryComponent::RemoveItemFromSlot(int32 SlotIndex, int32 Quantity)
         Slot.Clear();
     }
 
-    BroadcastInventoryChanged(SlotIndex, Slot.bIsEmpty ? nullptr : Slot.Item);
-    OnItemRemoved.Broadcast(Item, CanRemove, SlotIndex);
+        BroadcastInventoryChanged(SlotIndex, Slot.bIsEmpty ? nullptr : Slot.Item);
+        OnItemRemoved.Broadcast(Item, CanRemove, SlotIndex);
 
     // 캐시 업데이트
     UpdateItemCache();
@@ -571,15 +576,36 @@ void UHSInventoryComponent::ServerMoveItem_Implementation(int32 FromSlot, int32 
 
 void UHSInventoryComponent::MulticastInventoryUpdate_Implementation(int32 SlotIndex, UHSItemInstance* Item, int32 Quantity)
 {
-    if (IsValidSlotIndex(SlotIndex))
+    if (!IsValidSlotIndex(SlotIndex))
     {
-        FHSInventorySlot& Slot = InventorySlots[SlotIndex];
+        return;
+    }
+
+    if (GetOwner() && GetOwner()->HasAuthority())
+    {
+        // 서버는 이미 최신 상태를 반영했으므로 추가 처리 불필요
+        return;
+    }
+
+    FHSInventorySlot& Slot = InventorySlots[SlotIndex];
+
+    if (!Item || Quantity <= 0)
+    {
+        Slot.Clear();
+    }
+    else
+    {
         Slot.Item = Item;
         Slot.Quantity = Quantity;
-        Slot.bIsEmpty = (Item == nullptr || Quantity <= 0);
-        
-        BroadcastInventoryChanged(SlotIndex, Item);
+        Slot.MaxStackSize = Item->GetMaxStackSize();
+        Slot.bIsEmpty = false;
     }
+
+    UpdateItemCache();
+    UpdateEmptySlotCache();
+    SyncFastArrayState();
+
+    OnInventoryChanged.Broadcast(SlotIndex, Slot.bIsEmpty ? nullptr : Slot.Item);
 }
 
 void UHSInventoryComponent::OnRep_InventorySlots()
@@ -593,18 +619,26 @@ void UHSInventoryComponent::OnRep_InventorySlots()
     {
         OnInventoryChanged.Broadcast(i, InventorySlots[i].Item);
     }
+
+    SyncFastArrayState();
 }
 
 // 내부 헬퍼 함수들
-int32 UHSInventoryComponent::FindEmptySlot() const
+int32 UHSInventoryComponent::FindEmptySlot()
 {
-    // 캐시 사용으로 성능 최적화
-    if (EmptySlotCache.Num() > 0)
+    if (EmptySlotCache.Num() == 0)
     {
-        return EmptySlotCache[0];
+        UpdateEmptySlotCache();
     }
-    
-    return -1;
+
+    if (EmptySlotCache.Num() == 0)
+    {
+        return -1;
+    }
+
+    const int32 SlotIndex = EmptySlotCache[0];
+    EmptySlotCache.RemoveAt(0, 1, false);
+    return SlotIndex;
 }
 
 int32 UHSInventoryComponent::FindSlotWithItem(UHSItemInstance* Item) const
@@ -667,11 +701,11 @@ void UHSInventoryComponent::BroadcastInventoryChanged(int32 SlotIndex, UHSItemIn
 {
     OnInventoryChanged.Broadcast(SlotIndex, Item);
     
-    // 네트워크 업데이트 (서버에서만)
     if (GetOwner() && GetOwner()->HasAuthority())
     {
         const FHSInventorySlot& Slot = InventorySlots[SlotIndex];
         MulticastInventoryUpdate(SlotIndex, Item, Slot.Quantity);
+        SyncFastArrayState();
     }
 }
 
@@ -690,4 +724,10 @@ void UHSInventoryComponent::CacheFrequentlyUsedData()
 {
     UpdateItemCache();
     UpdateEmptySlotCache();
+}
+
+void UHSInventoryComponent::SyncFastArrayState()
+{
+    const bool bShouldMarkDirty = GetOwner() && GetOwner()->HasAuthority();
+    ReplicatedFastSlots.SyncFromLegacyArray(InventorySlots, bShouldMarkDirty);
 }

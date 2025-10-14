@@ -44,6 +44,8 @@ void UHSStatsComponent::BeginPlay()
 		GetWorld()->GetTimerManager().SetTimer(RegenerationTimerHandle, this, 
 			&UHSStatsComponent::HandleRegeneration, 1.0f, true);
 	}
+
+	RefreshBaseAttributes();
 }
 
 float UHSStatsComponent::ApplyDamage(float DamageAmount, bool bIgnoreDefense)
@@ -336,6 +338,8 @@ void UHSStatsComponent::HandleLevelUp(int32 NewLevel, int32 StatPoints)
 	
 	// 레벨업 이벤트 발생
 	OnStatsLevelUp.Broadcast(NewLevel, StatPoints);
+
+	RefreshBaseAttributes();
 }
 
 void UHSStatsComponent::InitializeWarriorStats()
@@ -359,6 +363,8 @@ void UHSStatsComponent::InitializeWarriorStats()
 	AttributeSet->SetCriticalDamage(2.0f);
 	AttributeSet->SetMovementSpeed(550.0f);
 	AttributeSet->SetAttackSpeed(0.9f);
+
+	RefreshBaseAttributes();
 }
 
 void UHSStatsComponent::InitializeThiefStats()
@@ -382,6 +388,8 @@ void UHSStatsComponent::InitializeThiefStats()
 	AttributeSet->SetCriticalDamage(2.5f);
 	AttributeSet->SetMovementSpeed(700.0f);
 	AttributeSet->SetAttackSpeed(1.4f);
+
+	RefreshBaseAttributes();
 }
 
 void UHSStatsComponent::InitializeMageStats()
@@ -405,6 +413,8 @@ void UHSStatsComponent::InitializeMageStats()
 	AttributeSet->SetCriticalDamage(2.2f);
 	AttributeSet->SetMovementSpeed(600.0f);
 	AttributeSet->SetAttackSpeed(1.2f);
+
+	RefreshBaseAttributes();
 }
 
 // 공유 능력 시스템을 위한 추가 메서드 구현
@@ -455,24 +465,38 @@ void UHSStatsComponent::ApplyBuff(const FBuffData& BuffData)
 	{
 		return;
 	}
-	
+
 	// 기존 버프 확인
 	FBuffData* ExistingBuff = ActiveBuffs.FindByPredicate([&BuffData](const FBuffData& Buff)
 	{
 		return Buff.BuffID == BuffData.BuffID;
 	});
-	
+
 	if (ExistingBuff)
 	{
-		if (BuffData.bStackable && ExistingBuff->CurrentStacks < 10) // 최대 10스택
+		if (!ExistingBuff->bIsPercentage && FMath::IsNearlyZero(ExistingBuff->FlatValuePerStack))
 		{
-			ExistingBuff->CurrentStacks++;
-			ExistingBuff->Value += BuffData.Value;
+			ExistingBuff->FlatValuePerStack = ExistingBuff->Value;
+		}
+		if (ExistingBuff->bIsPercentage && FMath::IsNearlyZero(ExistingBuff->PercentValuePerStack))
+		{
+			ExistingBuff->PercentValuePerStack = ExistingBuff->Value;
+		}
+
+		if (BuffData.bStackable && ExistingBuff->CurrentStacks < MaxBuffStackCount)
+		{
+			const int32 NewStacks = FMath::Clamp(ExistingBuff->CurrentStacks + 1, 1, MaxBuffStackCount);
+			const int32 StackDelta = NewStacks - ExistingBuff->CurrentStacks;
+			if (StackDelta > 0)
+			{
+				ApplyBuffStacks(*ExistingBuff, StackDelta);
+				ExistingBuff->CurrentStacks = NewStacks;
+			}
 			ExistingBuff->RemainingTime = BuffData.Duration;
 		}
 		else
 		{
-			// 스택 불가능한 경우 시간만 갱신
+			// 스택 불가능한 경우 효과는 유지하고 지속 시간만 갱신
 			ExistingBuff->RemainingTime = BuffData.Duration;
 		}
 	}
@@ -480,11 +504,21 @@ void UHSStatsComponent::ApplyBuff(const FBuffData& BuffData)
 	{
 		// 새로운 버프 추가
 		FBuffData NewBuff = BuffData;
+		if (!NewBuff.bIsPercentage && FMath::IsNearlyZero(NewBuff.FlatValuePerStack))
+		{
+			NewBuff.FlatValuePerStack = NewBuff.Value;
+		}
+		if (NewBuff.bIsPercentage && FMath::IsNearlyZero(NewBuff.PercentValuePerStack))
+		{
+			NewBuff.PercentValuePerStack = NewBuff.Value;
+		}
+		NewBuff.CurrentStacks = FMath::Clamp(NewBuff.CurrentStacks, 1, MaxBuffStackCount);
 		NewBuff.RemainingTime = BuffData.Duration;
 		ActiveBuffs.Add(NewBuff);
+		FBuffData& StoredBuff = ActiveBuffs.Last();
 		
 		// 즉시 적용 버프 처리
-		ApplyBuffEffect(NewBuff, true);
+		ApplyBuffStacks(StoredBuff, StoredBuff.CurrentStacks);
 		
 		// 지속 시간이 있는 버프는 타이머 설정
 		if (BuffData.Duration > 0.0f)
@@ -509,7 +543,7 @@ void UHSStatsComponent::RemoveBuff(const FString& BuffID)
 		FBuffData& BuffToRemove = ActiveBuffs[BuffIndex];
 		
 		// 버프 효과 제거
-		ApplyBuffEffect(BuffToRemove, false);
+		ApplyBuffStacks(BuffToRemove, -BuffToRemove.CurrentStacks);
 		
 		// 버프 목록에서 제거
 		ActiveBuffs.RemoveAt(BuffIndex);
@@ -526,9 +560,9 @@ void UHSStatsComponent::RemoveBuff(const FString& BuffID)
 void UHSStatsComponent::ClearAllBuffs()
 {
 	// 모든 버프 효과 제거
-	for (const FBuffData& Buff : ActiveBuffs)
+	for (FBuffData& Buff : ActiveBuffs)
 	{
-		ApplyBuffEffect(Buff, false);
+		ApplyBuffStacks(Buff, -Buff.CurrentStacks);
 	}
 	
 	// 버프 목록 초기화
@@ -555,64 +589,272 @@ TArray<FBuffData> UHSStatsComponent::GetActiveBuffs() const
 	return ActiveBuffs;
 }
 
-void UHSStatsComponent::ApplyBuffEffect(const FBuffData& BuffData, bool bApply)
+void UHSStatsComponent::ApplyBuffStacks(FBuffData& BuffData, int32 StackDelta)
+{
+	if (!AttributeSet || StackDelta == 0)
+	{
+		return;
+	}
+
+	const float FlatPerStack = GetFlatValuePerStack(BuffData);
+	const float PercentPerStack = GetPercentValuePerStack(BuffData);
+
+	const float FlatDelta = FlatPerStack * StackDelta;
+	const float PercentDelta = PercentPerStack * StackDelta;
+
+	BuffData.AppliedFlatTotal += FlatDelta;
+	BuffData.AppliedPercentTotal += PercentDelta;
+
+	if (FMath::IsNearlyZero(BuffData.AppliedFlatTotal))
+	{
+		BuffData.AppliedFlatTotal = 0.0f;
+	}
+	if (FMath::IsNearlyZero(BuffData.AppliedPercentTotal))
+	{
+		BuffData.AppliedPercentTotal = 0.0f;
+	}
+
+	if (BuffData.BuffType == EBuffType::AllStats)
+	{
+		ApplyAllStatsDelta(BuffData, StackDelta);
+	}
+	else
+	{
+		if (!FMath::IsNearlyZero(FlatDelta))
+		{
+			UpdateStatAccumulator(BuffData.BuffType, false, FlatDelta);
+		}
+		if (!FMath::IsNearlyZero(PercentDelta))
+		{
+			UpdateStatAccumulator(BuffData.BuffType, true, PercentDelta);
+		}
+	}
+}
+
+void UHSStatsComponent::ApplyAllStatsDelta(FBuffData& BuffData, int32 StackDelta)
+{
+	static const TArray<EBuffType> AffectedTypes = {
+		EBuffType::Health,
+		EBuffType::Mana,
+		EBuffType::Stamina,
+		EBuffType::Attack,
+		EBuffType::Defense,
+		EBuffType::AttackSpeed,
+		EBuffType::MovementSpeed,
+		EBuffType::CriticalChance
+	};
+
+	const float FlatPerStack = GetFlatValuePerStack(BuffData);
+	const float PercentPerStack = GetPercentValuePerStack(BuffData);
+	const float FlatDelta = FlatPerStack * StackDelta;
+	const float PercentDelta = PercentPerStack * StackDelta;
+
+	for (EBuffType Type : AffectedTypes)
+	{
+		if (!FMath::IsNearlyZero(FlatDelta))
+		{
+			UpdateStatAccumulator(Type, false, FlatDelta);
+		}
+		if (!FMath::IsNearlyZero(PercentDelta))
+		{
+			UpdateStatAccumulator(Type, true, PercentDelta);
+		}
+	}
+}
+
+void UHSStatsComponent::UpdateStatAccumulator(EBuffType BuffType, bool bIsPercentage, float DeltaValue)
+{
+	if (!AttributeSet || BuffType == EBuffType::None || FMath::IsNearlyZero(DeltaValue))
+	{
+		return;
+	}
+
+	// 현재 ActiveBuffs가 없는 경우 새 기반값을 확보한다.
+	EnsureBaseAttributeCached(BuffType);
+
+	FBuffStatAccumulator& Accumulator = BuffAccumulators.FindOrAdd(BuffType);
+	if (bIsPercentage)
+	{
+		Accumulator.PercentBonus += DeltaValue;
+	}
+	else
+	{
+		Accumulator.FlatBonus += DeltaValue;
+	}
+
+	RecalculateAttributeFromAccumulator(BuffType);
+	CleanupAccumulatorIfNeutral(BuffType);
+}
+
+void UHSStatsComponent::RecalculateAttributeFromAccumulator(EBuffType BuffType)
 {
 	if (!AttributeSet)
 	{
 		return;
 	}
-	
-	float Multiplier = bApply ? 1.0f : -1.0f;
-	float Value = BuffData.Value * Multiplier;
-	
+
+	const FBuffStatAccumulator* AccumulatorPtr = BuffAccumulators.Find(BuffType);
+	const float FlatBonus = AccumulatorPtr ? AccumulatorPtr->FlatBonus : 0.0f;
+	const float PercentBonus = AccumulatorPtr ? AccumulatorPtr->PercentBonus : 0.0f;
+
+	float BaseValue = BaseAttributeValues.FindRef(BuffType);
+	if (BaseValue == 0.0f && !BaseAttributeValues.Contains(BuffType))
+	{
+		BaseValue = ExtractCurrentAttributeValue(BuffType);
+		BaseAttributeValues.Add(BuffType, BaseValue);
+	}
+
+	const float ModifiedValue = FMath::Max(0.0f, (BaseValue * (1.0f + PercentBonus)) + FlatBonus);
+
+	switch (BuffType)
+	{
+		case EBuffType::Health:
+			AttributeSet->SetMaxHealth(ModifiedValue);
+			break;
+		case EBuffType::Mana:
+			AttributeSet->SetMaxMana(ModifiedValue);
+			break;
+		case EBuffType::Stamina:
+			AttributeSet->SetMaxStamina(ModifiedValue);
+			break;
+		case EBuffType::Attack:
+			AttributeSet->SetAttackPower(ModifiedValue);
+			break;
+		case EBuffType::Defense:
+			AttributeSet->SetDefensePower(ModifiedValue);
+			break;
+		case EBuffType::AttackSpeed:
+			AttributeSet->SetAttackSpeed(ModifiedValue);
+			break;
+		case EBuffType::MovementSpeed:
+			AttributeSet->SetMovementSpeed(ModifiedValue);
+			break;
+		case EBuffType::CriticalChance:
+			AttributeSet->SetCriticalChance(FMath::Clamp(ModifiedValue, 0.0f, 1.0f));
+			break;
+		default:
+			break;
+	}
+}
+
+void UHSStatsComponent::EnsureBaseAttributeCached(EBuffType BuffType)
+{
+	if (!AttributeSet || BuffType == EBuffType::None)
+	{
+		return;
+	}
+
+	const FBuffStatAccumulator* AccumulatorPtr = BuffAccumulators.Find(BuffType);
+	const bool bHasModifier = AccumulatorPtr && (!FMath::IsNearlyZero(AccumulatorPtr->FlatBonus) || !FMath::IsNearlyZero(AccumulatorPtr->PercentBonus));
+
+	if (!BaseAttributeValues.Contains(BuffType) || !bHasModifier)
+	{
+		BaseAttributeValues.Add(BuffType, ExtractCurrentAttributeValue(BuffType));
+	}
+}
+
+float UHSStatsComponent::ExtractCurrentAttributeValue(EBuffType BuffType) const
+{
+	if (!AttributeSet)
+	{
+		return 0.0f;
+	}
+
+	switch (BuffType)
+	{
+		case EBuffType::Health:
+			return AttributeSet->GetMaxHealth();
+		case EBuffType::Mana:
+			return AttributeSet->GetMaxMana();
+		case EBuffType::Stamina:
+			return AttributeSet->GetMaxStamina();
+		case EBuffType::Attack:
+			return AttributeSet->GetAttackPower();
+		case EBuffType::Defense:
+			return AttributeSet->GetDefensePower();
+		case EBuffType::AttackSpeed:
+			return AttributeSet->GetAttackSpeed();
+		case EBuffType::MovementSpeed:
+			return AttributeSet->GetMovementSpeed();
+		case EBuffType::CriticalChance:
+			return AttributeSet->GetCriticalChance();
+		default:
+			break;
+	}
+
+	return 0.0f;
+}
+
+void UHSStatsComponent::RefreshBaseAttributes()
+{
+	if (!AttributeSet)
+	{
+		return;
+	}
+
+	const auto RefreshSingle = [this](EBuffType Type)
+	{
+		const float CurrentValue = ExtractCurrentAttributeValue(Type);
+		const FBuffStatAccumulator Accumulator = BuffAccumulators.FindRef(Type);
+		const float PercentFactor = 1.0f + Accumulator.PercentBonus;
+		float BaseValue = CurrentValue;
+
+		if (!FMath::IsNearlyZero(PercentFactor))
+		{
+			BaseValue = (CurrentValue - Accumulator.FlatBonus) / PercentFactor;
+		}
+
+		BaseAttributeValues.FindOrAdd(Type) = BaseValue;
+	};
+
+	RefreshSingle(EBuffType::Health);
+	RefreshSingle(EBuffType::Mana);
+	RefreshSingle(EBuffType::Stamina);
+	RefreshSingle(EBuffType::Attack);
+	RefreshSingle(EBuffType::Defense);
+	RefreshSingle(EBuffType::AttackSpeed);
+	RefreshSingle(EBuffType::MovementSpeed);
+	RefreshSingle(EBuffType::CriticalChance);
+}
+
+void UHSStatsComponent::CleanupAccumulatorIfNeutral(EBuffType BuffType)
+{
+	if (FBuffStatAccumulator* AccumulatorPtr = BuffAccumulators.Find(BuffType))
+	{
+		if (FMath::IsNearlyZero(AccumulatorPtr->FlatBonus) && FMath::IsNearlyZero(AccumulatorPtr->PercentBonus))
+		{
+			BuffAccumulators.Remove(BuffType);
+			BaseAttributeValues.Remove(BuffType);
+		}
+	}
+}
+
+float UHSStatsComponent::GetFlatValuePerStack(const FBuffData& BuffData) const
+{
+	if (!FMath::IsNearlyZero(BuffData.FlatValuePerStack))
+	{
+		return BuffData.FlatValuePerStack;
+	}
+
+	if (!BuffData.bIsPercentage)
+	{
+		return BuffData.Value;
+	}
+
+	return 0.0f;
+}
+
+float UHSStatsComponent::GetPercentValuePerStack(const FBuffData& BuffData) const
+{
+	if (!FMath::IsNearlyZero(BuffData.PercentValuePerStack))
+	{
+		return BuffData.PercentValuePerStack;
+	}
+
 	if (BuffData.bIsPercentage)
 	{
-		// 비율 기반 버프
-		switch (BuffData.BuffType)
-		{
-			case EBuffType::Health:
-				AttributeSet->SetMaxHealth(AttributeSet->GetMaxHealth() * (1.0f + Value));
-				break;
-			case EBuffType::Attack:
-				AttributeSet->SetAttackPower(AttributeSet->GetAttackPower() * (1.0f + Value));
-				break;
-			case EBuffType::Defense:
-				AttributeSet->SetDefensePower(AttributeSet->GetDefensePower() * (1.0f + Value));
-				break;
-			case EBuffType::AttackSpeed:
-				AttributeSet->SetAttackSpeed(AttributeSet->GetAttackSpeed() * (1.0f + Value));
-				break;
-			case EBuffType::MovementSpeed:
-				AttributeSet->SetMovementSpeed(AttributeSet->GetMovementSpeed() * (1.0f + Value));
-				break;
-			case EBuffType::CriticalChance:
-				AttributeSet->SetCriticalChance(AttributeSet->GetCriticalChance() + Value);
-				break;
-		}
+		return BuffData.Value;
 	}
-	else
-	{
-		// 고정값 버프
-		switch (BuffData.BuffType)
-		{
-			case EBuffType::Health:
-				AttributeSet->SetMaxHealth(AttributeSet->GetMaxHealth() + Value);
-				break;
-			case EBuffType::Attack:
-				AttributeSet->SetAttackPower(AttributeSet->GetAttackPower() + Value);
-				break;
-			case EBuffType::Defense:
-				AttributeSet->SetDefensePower(AttributeSet->GetDefensePower() + Value);
-				break;
-			case EBuffType::AttackSpeed:
-				AttributeSet->SetAttackSpeed(AttributeSet->GetAttackSpeed() + Value);
-				break;
-			case EBuffType::MovementSpeed:
-				AttributeSet->SetMovementSpeed(AttributeSet->GetMovementSpeed() + Value);
-				break;
-			case EBuffType::CriticalChance:
-				AttributeSet->SetCriticalChance(AttributeSet->GetCriticalChance() + Value);
-				break;
-		}
-	}
+
+	return 0.0f;
 }

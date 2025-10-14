@@ -16,6 +16,8 @@ UHSSaveGameManager::UHSSaveGameManager()
 {
     CurrentSaveData = nullptr;
     bOperationInProgress = false;
+    CurrentOperationStartTime = 0.0f;
+    ActiveSaveData.Reset();
     
     // 자동 저장 기본 설정
     bAutoSaveEnabled = false;
@@ -126,6 +128,8 @@ void UHSSaveGameManager::SaveGameAsync(int32 SlotIndex, UHSSaveGameData* SaveDat
     bOperationInProgress = true;
     CurrentOperationProgress = FHSSaveOperationProgress();
     CurrentOperationProgress.Operation = EHSSaveOperation::Save;
+    CurrentOperationStartTime = GetWorld() ? GetWorld()->GetTimeSeconds() : 0.0f;
+    ActiveSaveData.Reset(SaveData);
     
     // 비동기 저장 작업 시작
     PerformSaveOperation(SlotIndex, SaveData);
@@ -152,6 +156,8 @@ void UHSSaveGameManager::LoadGameAsync(int32 SlotIndex)
     bOperationInProgress = true;
     CurrentOperationProgress = FHSSaveOperationProgress();
     CurrentOperationProgress.Operation = EHSSaveOperation::Load;
+    CurrentOperationStartTime = GetWorld() ? GetWorld()->GetTimeSeconds() : 0.0f;
+    ActiveSaveData.Reset();
     
     // 비동기 로드 작업 시작
     PerformLoadOperation(SlotIndex);
@@ -764,8 +770,6 @@ void UHSSaveGameManager::SetSaveDirectory(const FString& Directory)
 
 void UHSSaveGameManager::PerformSaveOperation(int32 SlotIndex, UHSSaveGameData* SaveData)
 {
-    float OperationStartTime = GetWorld() ? GetWorld()->GetTimeSeconds() : 0.0f;
-    
     // 비동기 작업 시뮬레이션
     UpdateOperationProgress(0.1f, TEXT("데이터 검증 중..."));
     
@@ -808,12 +812,22 @@ void UHSSaveGameManager::UpdateOperationProgress(float Progress, const FString& 
     
     if (GetWorld())
     {
-        CurrentOperationProgress.ElapsedTime = GetWorld()->GetTimeSeconds() - CurrentOperationProgress.ElapsedTime;
-        
+        const float Now = GetWorld()->GetTimeSeconds();
+        if (CurrentOperationStartTime <= 0.0f)
+        {
+            CurrentOperationStartTime = Now;
+        }
+
+        CurrentOperationProgress.ElapsedTime = Now - CurrentOperationStartTime;
+
         if (Progress > 0.0f)
         {
-            float EstimatedTotal = CurrentOperationProgress.ElapsedTime / Progress;
-            CurrentOperationProgress.EstimatedRemainingTime = EstimatedTotal - CurrentOperationProgress.ElapsedTime;
+            const float EstimatedTotal = CurrentOperationProgress.ElapsedTime / Progress;
+            CurrentOperationProgress.EstimatedRemainingTime = FMath::Max(EstimatedTotal - CurrentOperationProgress.ElapsedTime, 0.0f);
+        }
+        else
+        {
+            CurrentOperationProgress.EstimatedRemainingTime = 0.0f;
         }
     }
     
@@ -824,6 +838,9 @@ void UHSSaveGameManager::CompleteOperation(EHSSaveResult Result, int32 SlotIndex
 {
     CurrentOperationProgress.bIsCompleted = true;
     bOperationInProgress = false;
+    CurrentOperationStartTime = 0.0f;
+    CurrentOperationProgress.EstimatedRemainingTime = 0.0f;
+    ActiveSaveData.Reset();
     
     OnSaveOperationCompleted.Broadcast(Result, SlotIndex);
     
@@ -833,7 +850,7 @@ void UHSSaveGameManager::CompleteOperation(EHSSaveResult Result, int32 SlotIndex
         FAsyncSaveTask NextTask;
         if (PendingSaveTasks.Dequeue(NextTask))
         {
-            SaveGameAsync(NextTask.SlotIndex, NextTask.SaveData);
+            SaveGameAsync(NextTask.SlotIndex, NextTask.SaveData.Get());
         }
     }
 }

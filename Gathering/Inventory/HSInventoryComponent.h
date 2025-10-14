@@ -5,6 +5,7 @@
 #include "Engine/DataTable.h"
 #include "Net/UnrealNetwork.h"
 #include "../../Items/HSItemBase.h"
+#include "Net/Serialization/FastArraySerializer.h"
 #include "HSInventoryComponent.generated.h"
 
 class UHSItemInstance;
@@ -56,6 +57,52 @@ struct HUNTINGSPIRIT_API FHSInventorySlot
     bool CanStack(UHSItemInstance* InItem) const;
     bool HasSpace(int32 InQuantity) const;
     void Clear();
+};
+
+/**
+ * FastArraySerializer 기반 슬롯 래퍼
+ * TODO: FFastArraySerializer를 통한 슬롯 델타 복제로 전환 시 본 구조를 사용
+ */
+USTRUCT()
+struct FHSInventorySlotFastArrayItem : public FFastArraySerializerItem
+{
+    GENERATED_BODY()
+
+    UPROPERTY()
+    int32 SlotIndex;
+
+    UPROPERTY()
+    FHSInventorySlot Slot;
+
+    FHSInventorySlotFastArrayItem()
+        : SlotIndex(INDEX_NONE)
+    {
+    }
+};
+
+USTRUCT()
+struct FHSInventorySlotFastArray : public FFastArraySerializer
+{
+    GENERATED_BODY()
+
+    UPROPERTY()
+    TArray<FHSInventorySlotFastArrayItem> Items;
+
+    void SyncFromLegacyArray(const TArray<FHSInventorySlot>& SourceSlots, bool bMarkDirty);
+
+    bool NetDeltaSerialize(FNetDeltaSerializeInfo& DeltaParms)
+    {
+        return FFastArraySerializer::FastArrayDeltaSerialize(Items, DeltaParms, *this);
+    }
+};
+
+template<>
+struct TStructOpsTypeTraits<FHSInventorySlotFastArray> : public TStructOpsTypeTraitsBase2<FHSInventorySlotFastArray>
+{
+    enum
+    {
+        WithNetDeltaSerializer = true
+    };
 };
 
 /**
@@ -201,13 +248,14 @@ protected:
     void OnRep_InventorySlots();
 
     // 내부 헬퍼 함수
-    int32 FindEmptySlot() const;
+    int32 FindEmptySlot();
     int32 FindSlotWithItem(UHSItemInstance* Item) const;
     int32 FindSlotWithSpace(UHSItemInstance* Item) const;
     void UpdateItemCache();
     void UpdateEmptySlotCache();
     bool IsValidSlotIndex(int32 SlotIndex) const;
     void BroadcastInventoryChanged(int32 SlotIndex, UHSItemInstance* Item);
+    void SyncFastArrayState();
 
     // 성능 최적화 함수
     void OptimizeNetworkUpdates();
@@ -216,8 +264,8 @@ protected:
 private:
     // 네트워크 최적화를 위한 변수
     static constexpr float NetworkUpdateInterval = 0.1f;
-    
-    // 오브젝트 풀링을 위한 정적 캐시
-    static TArray<FHSInventorySlot> SlotPool;
-    static int32 PoolIndex;
+
+    // FFastArraySerializer 전환 준비용 내부 상태
+    UPROPERTY()
+    FHSInventorySlotFastArray ReplicatedFastSlots;
 };
