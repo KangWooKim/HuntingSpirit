@@ -12,6 +12,7 @@
 #include "Engine/Engine.h"
 #include "Engine/World.h"
 #include "Containers/Queue.h"
+#include "Containers/Map.h"
 #include "HAL/ThreadSafeBool.h"
 #include "Async/AsyncWork.h"
 #include "HSNavMeshGenerator.generated.h"
@@ -103,6 +104,10 @@ public:
 
     // 작업 실행
     void DoWork();
+
+    bool WasSuccessful() const { return bTaskCompleted && ErrorMessage.IsEmpty(); }
+    const FString& GetErrorMessage() const { return ErrorMessage; }
+    const FHSNavMeshBuildTask& GetTaskInfo() const { return BuildTask; }
 
     // 작업 식별
     FORCEINLINE TStatId GetStatId() const
@@ -275,6 +280,7 @@ private:
 
     // 현재 실행 중인 비동기 작업들
     TArray<FAsyncTask<FHSAsyncNavMeshBuildTask>*> AsyncTasks;
+    TMap<FGuid, double> TaskStartTimes;
 
     // 더 이상 사용하지 않음 (UE5 호환성)
     // UPROPERTY()

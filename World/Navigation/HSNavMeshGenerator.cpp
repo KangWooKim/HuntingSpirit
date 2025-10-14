@@ -97,6 +97,7 @@ void UHSNavMeshGenerator::EndPlay(const EEndPlayReason::Type EndPlayReason)
         }
     }
     AsyncTasks.Empty();
+    TaskStartTimes.Empty();
     
     // UE5에서는 볼륨을 생성하지 않으므로 정리할 필요 없음
     
@@ -266,18 +267,19 @@ void UHSNavMeshGenerator::RebuildAllNavMesh(bool bClearExisting)
         NavigationSystem->CleanUp();
     }
     
-    // 전체 네비게이션 메시 재빌드
+    const double StartTime = FPlatformTime::Seconds();
     NavigationSystem->Build();
-    
-    // 통계 업데이트
+    const double ElapsedMs = (FPlatformTime::Seconds() - StartTime) * 1000.0;
+
     {
         FScopeLock Lock(&StatsUpdateCriticalSection);
         BuildStats.CompletedTasks++;
+        BuildStats.TotalBuildTimeMs += static_cast<float>(ElapsedMs);
     }
     
     if (bEnableDebugLogging)
     {
-        UE_LOG(LogTemp, Log, TEXT("HSNavMeshGenerator: 전체 네비게이션 메시가 재빌드되었습니다."));
+        UE_LOG(LogTemp, Log, TEXT("HSNavMeshGenerator: 전체 네비게이션 메시가 재빌드되었습니다. (%.2f ms)"), ElapsedMs);
     }
 }
 
@@ -375,7 +377,8 @@ void UHSNavMeshGenerator::ProcessNextBuildTask()
     AsyncTask->StartBackgroundTask();
     
     // 빌드 시작 시간 기록
-    double StartTime = FPlatformTime::Seconds();
+    const double StartTime = FPlatformTime::Seconds();
+    TaskStartTimes.Add(CurrentTask.TaskID, StartTime);
     
     if (bEnableDebugLogging)
     {
@@ -401,20 +404,66 @@ void UHSNavMeshGenerator::CheckAsyncTaskCompletion()
         
         if (Task && Task->IsDone())
         {
-            // 작업 완료 처리
+            FHSAsyncNavMeshBuildTask& CompletedTask = Task->GetTask();
+            const FGuid TaskID = CompletedTask.GetTaskInfo().TaskID;
+
+            const double EndTime = FPlatformTime::Seconds();
+            double ElapsedMs = 0.0;
+            if (double* StartTimePtr = TaskStartTimes.Find(TaskID))
             {
-                FScopeLock Lock(&StatsUpdateCriticalSection);
-                BuildStats.CompletedTasks++;
-                BuildStats.TotalBuildTimeMs += 100.0f; // 임시값, 실제로는 측정된 시간 사용
+                ElapsedMs = (EndTime - *StartTimePtr) * 1000.0;
+                TaskStartTimes.Remove(TaskID);
             }
-            
+            else
+            {
+                TaskStartTimes.Remove(TaskID);
+            }
+
+            const FBox& Bounds = CompletedTask.GetTaskInfo().BuildBounds;
+            float GeneratedArea = 0.0f;
+            if (Bounds.Min.X <= Bounds.Max.X && Bounds.Min.Y <= Bounds.Max.Y)
+            {
+                const FVector Extent = Bounds.GetExtent();
+                GeneratedArea = FMath::Max(0.0f, (Extent.X * 2.0f) * (Extent.Y * 2.0f));
+            }
+            const bool bSuccess = CompletedTask.WasSuccessful();
+
             // 작업 정리
             delete Task;
             AsyncTasks.RemoveAt(i);
             
+            {
+                FScopeLock Lock(&StatsUpdateCriticalSection);
+                if (bSuccess)
+                {
+                    BuildStats.CompletedTasks++;
+                    BuildStats.TotalBuildTimeMs += static_cast<float>(ElapsedMs);
+                    BuildStats.GeneratedAreaSize += GeneratedArea;
+                }
+                else
+                {
+                    BuildStats.FailedTasks++;
+                    BuildStats.TotalBuildTimeMs += static_cast<float>(ElapsedMs);
+                }
+            }
+
             if (bEnableDebugLogging)
             {
-                UE_LOG(LogTemp, Log, TEXT("HSNavMeshGenerator: 비동기 네비게이션 메시 빌드 작업이 완료되었습니다."));
+                if (bSuccess)
+                {
+                    UE_LOG(LogTemp, Log, TEXT("HSNavMeshGenerator: 비동기 네비게이션 메시 빌드 작업 완료 (TaskID: %s, %.2f ms)"),
+                           *TaskID.ToString(), ElapsedMs);
+                }
+                else
+                {
+                    UE_LOG(LogTemp, Warning, TEXT("HSNavMeshGenerator: 네비게이션 메시 빌드 작업 실패 (TaskID: %s) - %s"),
+                           *TaskID.ToString(), *CompletedTask.GetErrorMessage());
+                }
+            }
+
+            if (!bSuccess && !CompletedTask.GetErrorMessage().IsEmpty())
+            {
+                UE_LOG(LogTemp, Warning, TEXT("HSNavMeshGenerator: 빌드 작업 오류 - %s"), *CompletedTask.GetErrorMessage());
             }
         }
     }

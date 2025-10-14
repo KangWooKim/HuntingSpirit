@@ -4,6 +4,7 @@
 #include "Components/HierarchicalInstancedStaticMeshComponent.h"
 #include "Components/SceneComponent.h"
 #include "Components/PrimitiveComponent.h"
+#include "Components/StaticMeshComponent.h"
 #include "Engine/World.h"
 #include "Kismet/GameplayStatics.h"
 #include "NavigationSystem.h"
@@ -501,7 +502,74 @@ void AHSWorldGenerator::SpawnObjectsInChunk(FWorldChunk& Chunk)
     
     FVector ChunkWorldPos = ChunkToWorldLocation(Chunk.ChunkCoordinate);
     FVector ChunkStartPos = ChunkWorldPos - FVector(GenerationSettings.ChunkSize * 0.5f, GenerationSettings.ChunkSize * 0.5f, 0.0f);
-    
+    TArray<FVector> OccupiedLocations;
+    OccupiedLocations.Reserve(32);
+
+    auto IsLocationValid = [&OccupiedLocations](const FVector& CandidateLocation, float MinDistance) -> bool
+    {
+        if (MinDistance <= 0.0f)
+        {
+            return true;
+        }
+
+        const float MinDistanceSq = FMath::Square(MinDistance);
+        for (const FVector& ExistingLocation : OccupiedLocations)
+        {
+            if (FVector::DistSquared2D(ExistingLocation, CandidateLocation) < MinDistanceSq)
+            {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    auto TryComputePlacement = [&](const FBiomeSpawnableObject& Spawnable, FVector& OutLocation, FRotator& OutRotation) -> bool
+    {
+        const int32 MaxAttempts = 16;
+        for (int32 Attempt = 0; Attempt < MaxAttempts; ++Attempt)
+        {
+            FVector CandidateLocation = ChunkStartPos + FVector(
+                RandomStream.FRandRange(0.0f, GenerationSettings.ChunkSize),
+                RandomStream.FRandRange(0.0f, GenerationSettings.ChunkSize),
+                0.0f
+            );
+
+            float Height = Chunk.BiomeData->CalculateTerrainHeightAtPosition(
+                FVector2D(CandidateLocation.X, CandidateLocation.Y),
+                GenerationSettings.RandomSeed
+            );
+
+            CandidateLocation.Z = Height;
+            FVector FinalLocation = CandidateLocation + Spawnable.SpawnOffset;
+            FRotator FinalRotation(0.0f, RandomStream.FRandRange(0.0f, 360.0f), 0.0f);
+
+            if (Spawnable.bAlignToSurface)
+            {
+                FHitResult HitResult;
+                const FVector TraceStart = CandidateLocation + FVector(0.0f, 0.0f, 2000.0f);
+                const FVector TraceEnd = CandidateLocation - FVector(0.0f, 0.0f, 2000.0f);
+
+                if (GetWorld()->LineTraceSingleByChannel(HitResult, TraceStart, TraceEnd, ECC_WorldStatic))
+                {
+                    FinalLocation = HitResult.Location + Spawnable.SpawnOffset;
+                    FinalRotation = HitResult.Normal.Rotation();
+                    FinalRotation.Pitch -= 90.0f;
+                }
+            }
+
+            if (!IsLocationValid(FinalLocation, Spawnable.MinDistanceBetweenObjects))
+            {
+                continue;
+            }
+
+            OutLocation = FinalLocation;
+            OutRotation = FinalRotation;
+            return true;
+        }
+
+        return false;
+    };
+
     // 자원 노드 스폰
     TArray<FBiomeSpawnableObject> ResourcestoSpawn = Chunk.BiomeData->FilterSpawnablesByProbability(
         Chunk.BiomeData->ResourceNodes, 
@@ -523,45 +591,28 @@ void AHSWorldGenerator::SpawnObjectsInChunk(FWorldChunk& Chunk)
         
         int32 SpawnCount = RandomStream.RandRange(Resource.MinSpawnCount, Resource.MaxSpawnCount);
         
-        for (int32 i = 0; i < SpawnCount; i++)
+        int32 SpawnedCount = 0;
+        while (SpawnedCount < SpawnCount)
         {
-            // 랜덤 위치 생성
-            FVector SpawnLocation = ChunkStartPos + FVector(
-                RandomStream.FRandRange(0.0f, GenerationSettings.ChunkSize),
-                RandomStream.FRandRange(0.0f, GenerationSettings.ChunkSize),
-                0.0f
-            );
-            
-            // 높이 조정
-            float Height = Chunk.BiomeData->CalculateTerrainHeightAtPosition(
-                FVector2D(SpawnLocation.X, SpawnLocation.Y),
-                GenerationSettings.RandomSeed
-            );
-            SpawnLocation.Z = Height + Resource.SpawnOffset.Z;
-            
-            // 액터 스폰
+            FVector SpawnLocation;
+            FRotator SpawnRotation;
+            if (!TryComputePlacement(Resource, SpawnLocation, SpawnRotation))
+            {
+                break;
+            }
+
             FActorSpawnParameters SpawnParams;
             SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AdjustIfPossibleButAlwaysSpawn;
-            
-            if (AActor* SpawnedActor = GetWorld()->SpawnActor<AActor>(ActorClass, SpawnLocation, FRotator::ZeroRotator, SpawnParams))
+
+            if (AActor* SpawnedActor = GetWorld()->SpawnActor<AActor>(ActorClass, SpawnLocation, SpawnRotation, SpawnParams))
             {
                 Chunk.SpawnedActors.Add(SpawnedActor);
-                
-                // 표면 정렬
-                if (Resource.bAlignToSurface)
-                {
-                    // 레이캐스트로 표면 노멀 찾기
-                    FHitResult HitResult;
-                    FVector TraceStart = SpawnLocation + FVector(0, 0, 1000);
-                    FVector TraceEnd = SpawnLocation - FVector(0, 0, 1000);
-                    
-                    if (GetWorld()->LineTraceSingleByChannel(HitResult, TraceStart, TraceEnd, ECC_WorldStatic))
-                    {
-                        FRotator SurfaceRotation = HitResult.Normal.Rotation();
-                        SurfaceRotation.Pitch -= 90.0f; // 노멀을 업 벡터로 변환
-                        SpawnedActor->SetActorRotation(SurfaceRotation);
-                    }
-                }
+                OccupiedLocations.Add(SpawnedActor->GetActorLocation());
+                ++SpawnedCount;
+            }
+            else
+            {
+                break;
             }
         }
     }
@@ -571,8 +622,60 @@ void AHSWorldGenerator::SpawnObjectsInChunk(FWorldChunk& Chunk)
         Chunk.BiomeData->EnvironmentProps, 
         RandomStream
     );
-    
-    // 나머지 구현은 유사한 패턴으로 진행...
+
+    for (const FBiomeSpawnableObject& Prop : PropsToSpawn)
+    {
+        if (Prop.ActorClass.IsNull())
+        {
+            continue;
+        }
+
+        UClass* ActorClass = Prop.ActorClass.LoadSynchronous();
+        if (!ActorClass)
+        {
+            continue;
+        }
+
+        const AActor* ClassDefaultObject = Cast<AActor>(ActorClass->GetDefaultObject());
+        UStaticMeshComponent* DefaultMeshComponent = ClassDefaultObject ? ClassDefaultObject->FindComponentByClass<UStaticMeshComponent>() : nullptr;
+        UStaticMesh* StaticMesh = DefaultMeshComponent ? DefaultMeshComponent->GetStaticMesh() : nullptr;
+
+        const int32 SpawnCount = RandomStream.RandRange(Prop.MinSpawnCount, Prop.MaxSpawnCount);
+        int32 SpawnedCount = 0;
+
+        while (SpawnedCount < SpawnCount)
+        {
+            FVector SpawnLocation;
+            FRotator SpawnRotation;
+            if (!TryComputePlacement(Prop, SpawnLocation, SpawnRotation))
+            {
+                break;
+            }
+
+            if (StaticMesh)
+            {
+                const FTransform InstanceTransform(SpawnRotation, SpawnLocation);
+                SpawnInstancedMesh(Chunk, StaticMesh, InstanceTransform);
+                OccupiedLocations.Add(SpawnLocation);
+                ++SpawnedCount;
+                continue;
+            }
+
+            FActorSpawnParameters SpawnParams;
+            SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AdjustIfPossibleButAlwaysSpawn;
+
+            if (AActor* SpawnedProp = GetWorld()->SpawnActor<AActor>(ActorClass, SpawnLocation, SpawnRotation, SpawnParams))
+            {
+                Chunk.SpawnedActors.Add(SpawnedProp);
+                OccupiedLocations.Add(SpawnedProp->GetActorLocation());
+                ++SpawnedCount;
+            }
+            else
+            {
+                break;
+            }
+        }
+    }
 }
 
 void AHSWorldGenerator::SpawnInstancedMesh(FWorldChunk& Chunk, UStaticMesh* StaticMesh, const FTransform& Transform)
@@ -603,8 +706,10 @@ void AHSWorldGenerator::SpawnInstancedMesh(FWorldChunk& Chunk, UStaticMesh* Stat
         InstancedMeshComponents.Add(StaticMesh, InstanceComponent);
     }
     
-    // 인스턴스 추가
-    const int32 InstanceIndex = InstanceComponent->AddInstance(Transform);
+    // 인스턴스 추가 (컴포넌트 기준 좌표계)
+    const FTransform ComponentTransform = InstanceComponent->GetComponentTransform();
+    const FTransform LocalTransform = Transform.GetRelativeTransform(ComponentTransform);
+    const int32 InstanceIndex = InstanceComponent->AddInstance(LocalTransform);
 
     FChunkInstancedMeshEntry* Entry = Chunk.InstancedMeshEntries.FindByPredicate([InstanceComponent](const FChunkInstancedMeshEntry& Existing)
     {
