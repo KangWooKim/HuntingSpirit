@@ -78,7 +78,7 @@ if (Distance <= MaxDistance && DispatchPacketToClient(Connection, Packet, Payloa
 }
 ```
 
-### 5. 🌍 프로시저럴 월드 & 내비게이션 스트리밍
+### 5. 🌍 프로시저럴 월드 & 내비게이션 스트리밍(구현중)
 **소스**: `World/Generation/HSWorldGenerator.*`, `World/Navigation/HSNavMeshGenerator.*`
 
 - 노이즈 기반 바이옴 결정, 멀티스레드 청크 생성, 런타임 메시 구축을 결합하여 무한 월드를 구성합니다.
@@ -124,7 +124,7 @@ OnRunCompleted.Broadcast(Result, CurrentRun.Rewards);
 SaveProgressData();
 ```
 
-### 8. 🤝 협동 시너지 네트워크
+### 8. 🤝 협동 시너지 네트워크(구현중)
 **소스**: `Cooperation/TeamFormation/HSTeamFormationSystem.*`, `Cooperation/SharedAbilities/HSSharedAbilitySystem.*`, `Cooperation/Communication/HSCommunicationSystem.*`
 
 - 팀 매칭 후 역할 배분, 합동 스킬 쿨다운, 복합 보상 분배를 서브시스템 단위로 끊어 관리합니다.
