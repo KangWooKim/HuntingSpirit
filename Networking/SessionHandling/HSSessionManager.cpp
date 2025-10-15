@@ -15,6 +15,7 @@
 #include "Kismet/GameplayStatics.h"
 #include "OnlineSubsystemUtils.h"
 #include "Interfaces/OnlineIdentityInterface.h"
+#include "OnlineSubsystemTypes.h"
 
 // 우리 게임에서 사용할 세션 이름
 const FName HSGameSessionName = TEXT("HuntingSpiritGameSession");
@@ -548,13 +549,16 @@ bool UHSSessionManager::KickPlayer(const FString& PlayerName)
         return false;
     }
 
-    if (!SessionInterface->KickPlayer(*LocalPlayer->GetPreferredUniqueNetId(), NAME_GameSession, *TargetPlayerId))
+    TArray<FUniqueNetIdRef> PlayersToRemove;
+    PlayersToRemove.Add(TargetPlayerId.ToSharedRef());
+
+    if (!SessionInterface->UnregisterPlayers(NAME_GameSession, PlayersToRemove))
     {
         UE_LOG(LogTemp, Warning, TEXT("HSSessionManager: 플레이어 추방 실패 - %s"), *PlayerName);
         return false;
     }
 
-    UE_LOG(LogTemp, Log, TEXT("HSSessionManager: 플레이어 추방 성공 - %s"), *PlayerName);
+    UE_LOG(LogTemp, Log, TEXT("HSSessionManager: 플레이어 추방 요청 완료 - %s"), *PlayerName);
     return true;
 }
 

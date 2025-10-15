@@ -256,6 +256,12 @@ public:
     UFUNCTION(BlueprintPure, Category = "Connection Management")
     int32 GetConnectedPlayerCount() const;
 
+    UFUNCTION(BlueprintCallable, Category = "Connection Management")
+    void RegisterPlayerConnection(const FString& PlayerID, const FString& PlayerName, const FString& IPAddress, int32 Port);
+
+    UFUNCTION(BlueprintCallable, Category = "Connection Management")
+    void UnregisterPlayerConnection(const FString& PlayerID, const FString& Reason = TEXT("Player Logout"));
+
     // === 서버 설정 관리 ===
     UFUNCTION(BlueprintCallable, Category = "Server Configuration")
     void LoadServerConfig(EHSServerEnvironment Environment);
@@ -337,7 +343,7 @@ protected:
     void ValidateSessionIntegrity();
     
     // === 연결 관리 내부 함수 ===
-    void HandlePlayerConnection(const FString& PlayerID, const FString& IPAddress, int32 Port);
+    void HandlePlayerConnection(const FString& PlayerID, const FString& IPAddress, int32 Port, const FString& PlayerName, bool bAuthenticated);
     void HandlePlayerDisconnection(const FString& PlayerID, const FString& Reason);
     void UpdatePlayerConnectionMetrics();
     
@@ -402,7 +408,7 @@ private:
     // === 에러 처리 및 복구 ===
     void HandleServerError(const FString& ErrorMessage);
     void AttemptAutoRecovery();
-    bool ValidateServerState() const;
+    bool ValidateServerState(bool bRequireNetworkReady = true) const;
     
     // === 리소스 관리 ===
     void AllocateServerResources();

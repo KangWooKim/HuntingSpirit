@@ -6,9 +6,11 @@
 #include "Engine/NetConnection.h"
 #include "Engine/Engine.h"
 #include "TimerManager.h"
+#include "HAL/FileManager.h"
 #include "HAL/PlatformProcess.h"
 #include "HAL/PlatformFilemanager.h"
 #include "HAL/PlatformMemory.h"
+#include "HAL/PlatformTime.h"
 #include "Misc/DateTime.h"
 #include "Misc/Guid.h"
 #include "Misc/FileHelper.h"
@@ -99,10 +101,9 @@ void UHSDedicatedServerManager::Initialize(FSubsystemCollectionBase& Collection)
     {
         LoadServerConfig(EHSServerEnvironment::Development);
     }
-    
-    // 네트워크 초기화
-    InitializeNetworkListener();
-    
+
+    const bool bServerStarted = StartServer(EHSServerEnvironment::Development);
+
     // 성능 모니터링 시작
     StartPerformanceMonitoring();
     
@@ -110,6 +111,11 @@ void UHSDedicatedServerManager::Initialize(FSubsystemCollectionBase& Collection)
     EnableAutoSessionCleanup(true);
     EnableAutoPlayerTimeout(true);
     EnableAutoPerformanceOptimization(true);
+
+    if (!bServerStarted)
+    {
+        UE_LOG(LogTemp, Error, TEXT("HSDedicatedServerManager: 초기 서버 시작에 실패했습니다"));
+    }
     
     UE_LOG(LogTemp, Log, TEXT("HSDedicatedServerManager: 초기화 완료"));
 }
@@ -129,7 +135,7 @@ bool UHSDedicatedServerManager::StartServer(EHSServerEnvironment Environment)
 {
     FScopeLock Lock(&ServerMutex);
     
-    if (CurrentServerStatus != EHSServerStatus::Offline)
+    if (CurrentServerStatus != EHSServerStatus::Offline && CurrentServerStatus != EHSServerStatus::Error)
     {
         UE_LOG(LogTemp, Warning, TEXT("HSDedicatedServerManager: 서버가 이미 실행 중이거나 시작 중입니다"));
         return false;
@@ -143,7 +149,7 @@ bool UHSDedicatedServerManager::StartServer(EHSServerEnvironment Environment)
     // 환경별 설정 로드
     LoadServerConfig(Environment);
     
-    if (!ValidateServerState())
+    if (!ValidateServerState(false))
     {
         HandleServerError(TEXT("서버 상태 검증 실패"));
         return false;
@@ -156,6 +162,15 @@ bool UHSDedicatedServerManager::StartServer(EHSServerEnvironment Environment)
     if (!InitializeNetworkListener())
     {
         HandleServerError(TEXT("네트워크 리스너 초기화 실패"));
+        DeallocateServerResources();
+        return false;
+    }
+    
+    if (!ValidateServerState(true))
+    {
+        HandleServerError(TEXT("네트워크 초기화 검증 실패"));
+        ShutdownNetworkListener();
+        DeallocateServerResources();
         return false;
     }
     
@@ -165,6 +180,8 @@ bool UHSDedicatedServerManager::StartServer(EHSServerEnvironment Environment)
 #elif PLATFORM_LINUX
     InitializeLinuxSpecific();
 #endif
+    
+    ConsecutiveErrorCount = 0;
     
     UpdateServerStatus(EHSServerStatus::Online);
     
@@ -473,6 +490,30 @@ int32 UHSDedicatedServerManager::GetConnectedPlayerCount() const
 {
     FScopeLock Lock(&PlayerMutex);
     return ConnectedPlayers.Num();
+}
+
+void UHSDedicatedServerManager::RegisterPlayerConnection(const FString& PlayerID, const FString& PlayerName, const FString& IPAddress, int32 Port)
+{
+    if (PlayerID.IsEmpty())
+    {
+        UE_LOG(LogTemp, Warning, TEXT("HSDedicatedServerManager: 빈 플레이어 ID로 연결 등록을 시도했습니다"));
+        return;
+    }
+
+    const FString SanitizedName = PlayerName.IsEmpty() ? PlayerID : PlayerName;
+    const FString SanitizedIP = IPAddress.IsEmpty() ? TEXT("Unknown") : IPAddress;
+
+    HandlePlayerConnection(PlayerID, SanitizedIP, Port, SanitizedName, true);
+}
+
+void UHSDedicatedServerManager::UnregisterPlayerConnection(const FString& PlayerID, const FString& Reason)
+{
+    if (PlayerID.IsEmpty())
+    {
+        return;
+    }
+
+    HandlePlayerDisconnection(PlayerID, Reason.IsEmpty() ? TEXT("Player Logout") : Reason);
 }
 
 void UHSDedicatedServerManager::LoadServerConfig(EHSServerEnvironment Environment)
@@ -800,17 +841,32 @@ void UHSDedicatedServerManager::ValidateSessionIntegrity()
     }
 }
 
-void UHSDedicatedServerManager::HandlePlayerConnection(const FString& PlayerID, const FString& IPAddress, int32 Port)
+void UHSDedicatedServerManager::HandlePlayerConnection(const FString& PlayerID, const FString& IPAddress, int32 Port, const FString& PlayerName, bool bAuthenticated)
 {
     FScopeLock Lock(&PlayerMutex);
     
+    if (FHSPlayerConnectionInfo* ExistingInfo = ConnectedPlayers.Find(PlayerID))
+    {
+        ExistingInfo->PlayerName = PlayerName.IsEmpty() ? ExistingInfo->PlayerName : PlayerName;
+        ExistingInfo->IPAddress = IPAddress;
+        ExistingInfo->Port = Port;
+        ExistingInfo->ConnectionTime = FDateTime::Now();
+        ExistingInfo->bIsAuthenticated = bAuthenticated;
+        
+        UE_LOG(LogTemp, Log, TEXT("HSDedicatedServerManager: 플레이어 정보 업데이트 - %s (%s:%d)"), 
+               *PlayerID, *IPAddress, Port);
+        
+        OnPlayerConnected.Broadcast(*ExistingInfo);
+        return;
+    }
+
     FHSPlayerConnectionInfo PlayerInfo;
     PlayerInfo.PlayerID = PlayerID;
-    PlayerInfo.PlayerName = FString::Printf(TEXT("Player_%s"), *PlayerID.Right(8));
+    PlayerInfo.PlayerName = PlayerName.IsEmpty() ? FString::Printf(TEXT("Player_%s"), *PlayerID.Right(8)) : PlayerName;
     PlayerInfo.IPAddress = IPAddress;
     PlayerInfo.Port = Port;
     PlayerInfo.ConnectionTime = FDateTime::Now();
-    PlayerInfo.bIsAuthenticated = false;
+    PlayerInfo.bIsAuthenticated = bAuthenticated;
     
     ConnectedPlayers.Add(PlayerID, PlayerInfo);
     
@@ -875,12 +931,15 @@ void UHSDedicatedServerManager::UpdatePlayerConnectionMetrics()
 
 void UHSDedicatedServerManager::CollectCPUMetrics()
 {
-    float CpuUsage = FPlatformProcess::GetCPUUsage();
-    if (CpuUsage < 0.0f)
-    {
-        CpuUsage = 0.0f;
-    }
-    CurrentMetrics.CPUUsagePercent = FMath::Clamp(CpuUsage, 0.0f, 100.0f);
+    float CpuUsagePercent = 0.0f;
+
+    const float DeltaSeconds = GetWorld() ? GetWorld()->GetDeltaSeconds() : 0.0f;
+    FPlatformTime::UpdateCPUTime(DeltaSeconds);
+
+    const FCPUTime CpuSample = FPlatformTime::GetCPUTime();
+    CpuUsagePercent = CpuSample.CPUTimePct;
+
+    CurrentMetrics.CPUUsagePercent = FMath::Clamp(CpuUsagePercent, 0.0f, 100.0f);
 }
 
 void UHSDedicatedServerManager::CollectMemoryMetrics()
@@ -977,7 +1036,9 @@ void UHSDedicatedServerManager::CollectGameplayMetrics()
                     continue;
                 }
 
-                TotalPacketLossPercent += Connection->AvgLoss * 100.0f;
+                const float IncomingLoss = Connection->GetInLossPercentage().GetAvgLossPercentage();
+                const float OutgoingLoss = Connection->GetOutLossPercentage().GetAvgLossPercentage();
+                TotalPacketLossPercent += (IncomingLoss + OutgoingLoss) * 50.0f;
                 ++ConnectionCount;
             }
         }
@@ -1248,7 +1309,7 @@ void UHSDedicatedServerManager::LogSecurityEvent(const FString& Event, const FSt
     const FString LogLine = FString::Printf(TEXT("%s | %s | Player: %s%s"),
         *FDateTime::UtcNow().ToString(), *Event, *PlayerID, LINE_TERMINATOR);
 
-    if (!FFileHelper::SaveStringToFile(LogLine, *LogFilePath, FFileHelper::EEncodingOptions::AutoDetect, &PlatformFile, FILEWRITE_Append))
+    if (!FFileHelper::SaveStringToFile(LogLine, *LogFilePath, FFileHelper::EEncodingOptions::AutoDetect, &IFileManager::Get(), FILEWRITE_Append))
     {
         UE_LOG(LogTemp, Error, TEXT("HSDedicatedServerManager: 보안 이벤트 로그 기록 실패 - %s"), *LogFilePath);
     }
@@ -1305,16 +1366,16 @@ void UHSDedicatedServerManager::AttemptAutoRecovery()
     }
 }
 
-bool UHSDedicatedServerManager::ValidateServerState() const
+bool UHSDedicatedServerManager::ValidateServerState(bool bRequireNetworkReady) const
 {
     if (!IsConfigurationValid())
     {
         return false;
     }
     
-    if (!IsServerInitialized())
+    if (bRequireNetworkReady)
     {
-        return false;
+        return IsServerInitialized() && IsNetworkReady();
     }
     
     return true;

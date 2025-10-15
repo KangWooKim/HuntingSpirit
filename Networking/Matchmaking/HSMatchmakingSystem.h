@@ -237,7 +237,7 @@ protected:
     
     // 온라인 서브시스템 연동
     void HandleSessionSearchComplete(bool bWasSuccessful);
-    void HandleJoinSessionComplete(FName SessionName, bool bWasSuccessful);
+    void HandleJoinSessionComplete(FName SessionName, EOnJoinSessionCompleteResult::Type Result);
     
     // 타이머 및 캐싱
     FTimerHandle MatchmakingTimerHandle;

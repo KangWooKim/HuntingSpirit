@@ -1,12 +1,14 @@
 #include "HSMatchmakingSystem.h"
 #include "Engine/World.h"
 #include "Engine/GameInstance.h"
+#include "Online/OnlineSessionNames.h"
+#include "OnlineSessionSettings.h"
 #include "Engine/LocalPlayer.h"
 #include "TimerManager.h"
 #include "Kismet/GameplayStatics.h"
 #include "OnlineSubsystemUtils.h"
-#include "OnlineSessionNames.h"
 #include "Interfaces/OnlineIdentityInterface.h"
+#include "UObject/UnrealType.h"
 #include "Internationalization/Internationalization.h"
 #include "Internationalization/Culture.h"
 
@@ -642,20 +644,21 @@ void UHSMatchmakingSystem::HandleSessionSearchComplete(bool bWasSuccessful)
     }
 }
 
-void UHSMatchmakingSystem::HandleJoinSessionComplete(FName SessionName, bool bWasSuccessful)
+void UHSMatchmakingSystem::HandleJoinSessionComplete(FName SessionName, EOnJoinSessionCompleteResult::Type Result)
 {
     bHasPendingSessionResult = false;
     PendingSessionResult = FOnlineSessionSearchResult();
-    
-    if (bWasSuccessful)
+
+    if (Result == EOnJoinSessionCompleteResult::Success)
     {
         UE_LOG(LogTemp, Log, TEXT("HSMatchmakingSystem: 세션 참가 성공: %s"), *SessionName.ToString());
         UpdateMatchmakingStatus(EHSMatchmakingStatus::InMatch);
     }
     else
     {
-        UE_LOG(LogTemp, Error, TEXT("HSMatchmakingSystem: 세션 참가 실패: %s"), *SessionName.ToString());
-        HandleMatchmakingError(TEXT("세션 참가 실패"));
+        const TCHAR* ResultString = LexToString(Result);
+        UE_LOG(LogTemp, Error, TEXT("HSMatchmakingSystem: 세션 참가 실패: %s (%s)"), *SessionName.ToString(), ResultString);
+        HandleMatchmakingError(FString::Printf(TEXT("세션 참가 실패 (%s)"), ResultString));
     }
 }
 
@@ -791,7 +794,7 @@ FHSMatchInfo UHSMatchmakingSystem::BuildMatchInfoFromResult(const FOnlineSession
     MatchInfo.AverageSkillRating = AverageSkill;
 
     FString ServerAddress;
-    if (SessionInterface.IsValid() && SessionInterface->GetResolvedConnectString(SearchResult, ServerAddress))
+    if (SessionInterface.IsValid() && SessionInterface->GetResolvedConnectString(SearchResult, NAME_GamePort, ServerAddress))
     {
         MatchInfo.ServerAddress = ServerAddress;
     }

@@ -5,6 +5,7 @@
 #include "Engine/Engine.h"
 #include "HAL/PlatformFilemanager.h"
 #include "HAL/PlatformMemory.h"
+#include "HAL/PlatformTime.h"
 #include "HAL/PlatformProcess.h"
 #include "HAL/ThreadManager.h"
 #include "Misc/FileHelper.h"
@@ -16,12 +17,6 @@
 #if PLATFORM_WINDOWS && defined(_MSC_VER)
     #include <immintrin.h>
     #include <emmintrin.h>
-#endif
-
-#if PLATFORM_WINDOWS
-    #include "Windows/AllowWindowsPlatformTypes.h"
-    #include <windows.h>
-    #include "Windows/HideWindowsPlatformTypes.h"
 #endif
 
 DEFINE_LOG_CATEGORY_STATIC(LogHSPerformance, Log, All);
@@ -520,125 +515,24 @@ float UHSPerformanceOptimizer::GetCurrentCPUUsage()
         return CachedUsage;
     }
 
-    auto StoreResult = [&](float Value) -> float
+    const auto StoreResult = [&](float Value) -> float
     {
         CachedUsage = FMath::Clamp(Value, 0.0f, 100.0f);
         LastUpdateTime = Now;
         return CachedUsage;
     };
 
-    float PlatformUsage = FPlatformProcess::GetCPUUsage();
-    if (PlatformUsage >= 0.0f)
+    const float DeltaSeconds = (LastUpdateTime > 0.0) ? static_cast<float>(Now - LastUpdateTime) : 0.0f;
+    FPlatformTime::UpdateCPUTime(DeltaSeconds);
+
+    const FCPUTime CpuSample = FPlatformTime::GetCPUTime();
+    float CpuUsage = CpuSample.CPUTimePct;
+    if (CpuUsage <= 0.0f && CpuSample.CPUTimePctRelative > 0.0f)
     {
-        return StoreResult(PlatformUsage);
+        CpuUsage = CpuSample.CPUTimePctRelative;
     }
 
-#if PLATFORM_WINDOWS
-    static uint64 PreviousIdleTime = 0;
-    static uint64 PreviousKernelTime = 0;
-    static uint64 PreviousUserTime = 0;
-
-    FILETIME IdleTime, KernelTime, UserTime;
-    if (GetSystemTimes(&IdleTime, &KernelTime, &UserTime))
-    {
-        auto ToUInt64 = [](const FILETIME& Time) -> uint64
-        {
-            return (static_cast<uint64>(Time.dwHighDateTime) << 32) | Time.dwLowDateTime;
-        };
-
-        const uint64 Idle = ToUInt64(IdleTime);
-        const uint64 Kernel = ToUInt64(KernelTime);
-        const uint64 User = ToUInt64(UserTime);
-
-        if (PreviousIdleTime == 0 && PreviousKernelTime == 0 && PreviousUserTime == 0)
-        {
-            PreviousIdleTime = Idle;
-            PreviousKernelTime = Kernel;
-            PreviousUserTime = User;
-            return StoreResult(0.0f);
-        }
-
-        const uint64 IdleDiff = Idle - PreviousIdleTime;
-        const uint64 KernelDiff = Kernel - PreviousKernelTime;
-        const uint64 UserDiff = User - PreviousUserTime;
-        const uint64 TotalDiff = KernelDiff + UserDiff;
-
-        PreviousIdleTime = Idle;
-        PreviousKernelTime = Kernel;
-        PreviousUserTime = User;
-
-        if (TotalDiff == 0)
-        {
-            return StoreResult(0.0f);
-        }
-
-        const float Usage = static_cast<float>(TotalDiff - IdleDiff) * 100.0f / static_cast<float>(TotalDiff);
-        return StoreResult(Usage);
-    }
-    return StoreResult(0.0f);
-#elif PLATFORM_LINUX
-    static uint64 PreviousTotalTime = 0;
-    static uint64 PreviousIdleAllTime = 0;
-
-    FString StatContents;
-    if (FFileHelper::LoadFileToString(StatContents, TEXT("/proc/stat")))
-    {
-        TArray<FString> Lines;
-        StatContents.ParseIntoArrayLines(Lines, true);
-        if (Lines.Num() > 0)
-        {
-            const FString CpuLine = Lines[0].TrimStartAndEnd();
-            TArray<FString> Tokens;
-            CpuLine.ParseIntoArray(Tokens, TEXT(" "), true);
-
-            if (Tokens.Num() >= 5 && Tokens[0] == TEXT("cpu"))
-            {
-                auto ToUint64 = [](const FString& Value) -> uint64
-                {
-                    return static_cast<uint64>(FCString::Strtoui64(*Value, nullptr, 10));
-                };
-
-                const uint64 User = ToUint64(Tokens[1]);
-                const uint64 Nice = Tokens.Num() > 2 ? ToUint64(Tokens[2]) : 0;
-                const uint64 System = Tokens.Num() > 3 ? ToUint64(Tokens[3]) : 0;
-                const uint64 Idle = Tokens.Num() > 4 ? ToUint64(Tokens[4]) : 0;
-                const uint64 IOWait = Tokens.Num() > 5 ? ToUint64(Tokens[5]) : 0;
-                const uint64 IRQ = Tokens.Num() > 6 ? ToUint64(Tokens[6]) : 0;
-                const uint64 SoftIRQ = Tokens.Num() > 7 ? ToUint64(Tokens[7]) : 0;
-                const uint64 Steal = Tokens.Num() > 8 ? ToUint64(Tokens[8]) : 0;
-
-                const uint64 IdleAll = Idle + IOWait;
-                const uint64 SystemAll = System + IRQ + SoftIRQ;
-                const uint64 Total = User + Nice + SystemAll + IdleAll + Steal;
-
-                if (PreviousTotalTime == 0 && PreviousIdleAllTime == 0)
-                {
-                    PreviousTotalTime = Total;
-                    PreviousIdleAllTime = IdleAll;
-                    return StoreResult(0.0f);
-                }
-
-                const uint64 TotalDiff = Total - PreviousTotalTime;
-                const uint64 IdleDiff = IdleAll - PreviousIdleAllTime;
-
-                PreviousTotalTime = Total;
-                PreviousIdleAllTime = IdleAll;
-
-                if (TotalDiff == 0)
-                {
-                    return StoreResult(0.0f);
-                }
-
-                const float Usage = static_cast<float>(TotalDiff - IdleDiff) * 100.0f / static_cast<float>(TotalDiff);
-                return StoreResult(Usage);
-            }
-        }
-    }
-
-    return StoreResult(0.0f);
-#else
-    return StoreResult(0.0f);
-#endif
+    return StoreResult(CpuUsage);
 }
 
 int32 UHSPerformanceOptimizer::PackBoolArrayToBits_BP(const TArray<bool>& BoolArray)
