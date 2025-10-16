@@ -3,6 +3,7 @@
 #include "HSCombatComponent.h"
 #include "HuntingSpirit/Characters/Base/HSCharacterBase.h"
 #include "HuntingSpirit/Combat/HSHitReactionComponent.h"
+#include "HuntingSpirit/Characters/Stats/HSStatsComponent.h"
 #include "GameFramework/Character.h"
 #include "Engine/World.h"
 #include "TimerManager.h"
@@ -242,15 +243,29 @@ float UHSCombatComponent::CalculateFinalDamage(const FHSDamageInfo& DamageInfo, 
         case EHSDamageCalculationMode::StatBased:
         {
             // 공격자의 스탯을 기반으로 데미지 계산 (예: 공격력 * 배수)
+            float AttackPower = 0.0f;
             if (DamageInstigator)
             {
-                UHSCombatComponent* InstigatorCombat = DamageInstigator->FindComponentByClass<UHSCombatComponent>();
-                if (InstigatorCombat)
+                if (const AHSCharacterBase* InstigatorCharacter = Cast<AHSCharacterBase>(DamageInstigator))
                 {
-                    // 여기서는 기본 공격력을 MaxHealth의 10%로 가정
-                    float AttackPower = InstigatorCombat->GetMaxHealth() * 0.1f;
-                    BaseDamage = AttackPower * DamageInfo.BaseDamage;
+                    if (const UHSStatsComponent* Stats = InstigatorCharacter->GetStatsComponent())
+                    {
+                        AttackPower = Stats->GetAttackPower();
+                    }
                 }
+                if (FMath::IsNearlyZero(AttackPower))
+                {
+                    if (const UHSCombatComponent* InstigatorCombat = DamageInstigator->FindComponentByClass<UHSCombatComponent>())
+                    {
+                        AttackPower = InstigatorCombat->GetMaxHealth() * 0.05f;
+                    }
+                }
+            }
+
+            if (AttackPower > 0.0f)
+            {
+                const float Scaling = (DamageInfo.BaseDamage > 0.0f) ? DamageInfo.BaseDamage : 1.0f;
+                BaseDamage = AttackPower * Scaling;
             }
             break;
         }
@@ -544,20 +559,28 @@ void UHSCombatComponent::SetNextAttackDamageMultiplier(float Multiplier)
 
 void UHSCombatComponent::AddElementalDamage(EHSDamageType DamageType, float Amount)
 {
-    if (DamageType == EHSDamageType::Physical || DamageType == EHSDamageType::None)
+    if (DamageType == EHSDamageType::Physical || DamageType == EHSDamageType::None || Amount <= 0.0f)
     {
         return; // 물리 데미지나 None 타입은 추가하지 않음
     }
-    
+
+    if (!GetWorld())
+    {
+        return;
+    }
+
     float& CurrentAmount = AdditionalElementalDamage.FindOrAdd(DamageType);
     CurrentAmount += Amount;
-    
-    // 일정 시간 후 제거 (5초)
-    FTimerHandle RemoveTimerHandle;
-    GetWorld()->GetTimerManager().SetTimer(RemoveTimerHandle, [this, DamageType]()
-    {
-        AdditionalElementalDamage.Remove(DamageType);
-    }, 5.0f, false);
+
+    const int32 StackId = ++ElementalDamageStackIdCounter;
+    FElementalDamageStackInfo& StackInfo = ActiveElementalDamageStacks.FindOrAdd(StackId);
+    StackInfo.DamageType = DamageType;
+    StackInfo.Amount = Amount;
+
+    FTimerDelegate TimerDelegate;
+    TimerDelegate.BindUFunction(this, FName("HandleElementalDamageExpired"), StackId);
+    FTimerHandle ExpirationHandle;
+    GetWorld()->GetTimerManager().SetTimer(ExpirationHandle, TimerDelegate, 5.0f, false);
 }
 
 void UHSCombatComponent::TakeDamage(float DamageAmount, EHSDamageType DamageType, AActor* DamageInstigator)
@@ -600,4 +623,20 @@ void UHSCombatComponent::DisableDamageSharing()
     bDamageSharingEnabled = false;
     DamageShareRatio = 0.0f;
     DamageSharingTeamMembers.Empty();
+}
+
+void UHSCombatComponent::HandleElementalDamageExpired(int32 StackId)
+{
+    if (FElementalDamageStackInfo* StackInfo = ActiveElementalDamageStacks.Find(StackId))
+    {
+        if (float* CurrentAmount = AdditionalElementalDamage.Find(StackInfo->DamageType))
+        {
+            *CurrentAmount = FMath::Max(0.0f, *CurrentAmount - StackInfo->Amount);
+            if (*CurrentAmount <= KINDA_SMALL_NUMBER)
+            {
+                AdditionalElementalDamage.Remove(StackInfo->DamageType);
+            }
+        }
+        ActiveElementalDamageStacks.Remove(StackId);
+    }
 }

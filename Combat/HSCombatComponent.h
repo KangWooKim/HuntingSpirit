@@ -414,6 +414,13 @@ protected:
      * @brief 추가 원소 데미지 맵
      */
     TMap<EHSDamageType, float> AdditionalElementalDamage;
+    struct FElementalDamageStackInfo
+    {
+        EHSDamageType DamageType = EHSDamageType::None;
+        float Amount = 0.0f;
+    };
+    TMap<int32, FElementalDamageStackInfo> ActiveElementalDamageStacks;
+    int32 ElementalDamageStackIdCounter = 0;
     
     /**
      * @brief 데미지 공유 활성화 여부
@@ -512,4 +519,7 @@ private:
      */
     UFUNCTION(NetMulticast, Reliable)
     void MulticastOnCharacterDied(AActor* DeadCharacter);
+
+    UFUNCTION()
+    void HandleElementalDamageExpired(int32 StackId);
 };

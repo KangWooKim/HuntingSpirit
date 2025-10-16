@@ -56,6 +56,12 @@ public:
     virtual void BeginPlay() override;
 
     /**
+     * @brief 매 프레임 호출되는 업데이트 처리
+     * @param DeltaSeconds 이전 프레임과의 시간 차이
+     */
+    virtual void Tick(float DeltaSeconds) override;
+
+    /**
      * @brief AI를 시작합니다
      * @details 행동 트리를 실행하고 AI 로직을 활성화합니다
      */

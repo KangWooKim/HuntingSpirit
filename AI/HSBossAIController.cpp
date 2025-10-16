@@ -10,6 +10,7 @@
 #include "HuntingSpirit/Enemies/Bosses/HSBossBase.h"
 #include "HuntingSpirit/Characters/Player/HSPlayerCharacter.h"
 #include "HuntingSpirit/Characters/Stats/HSStatsComponent.h"
+#include "HuntingSpirit/Core/PlayerState/HSPlayerState.h"
 #include "BehaviorTree/BehaviorTree.h"
 #include "BehaviorTree/BlackboardComponent.h"
 #include "BehaviorTree/BlackboardData.h"
@@ -735,7 +736,7 @@ FHSBossAttackPattern AHSBossAIController::SelectPatternForPhase(EHSBossPhase Pha
 // 패턴 조건 평가
 bool AHSBossAIController::EvaluatePatternConditions(const FHSBossAttackPattern& Pattern)
 {
-    if (!PrimaryTarget)
+    if (!PrimaryTarget || !ControlledBoss)
     {
         return false;
     }
@@ -755,7 +756,7 @@ bool AHSBossAIController::EvaluatePatternConditions(const FHSBossAttackPattern& 
     
     // 쿨다운 확인
     float CurrentTime = GetWorld()->GetTimeSeconds();
-    if (CurrentTime - LastPatternExecutionTime < Pattern.Cooldown)
+    if (LastPatternExecutionTime > 0.0f && (CurrentTime - LastPatternExecutionTime) < Pattern.Cooldown)
     {
         return false;
     }
@@ -806,7 +807,7 @@ float AHSBossAIController::CalculatePatternScore(const FHSBossAttackPattern& Pat
 // 위협 수준 평가
 float AHSBossAIController::EvaluateThreatLevel(AActor* Target)
 {
-    if (!Target)
+    if (!Target || !ControlledBoss)
     {
         return 0.0f;
     }
@@ -1074,6 +1075,16 @@ void AHSBossAIController::ValidateTargets()
     {
         return !IsValidTarget(Target);
     });
+
+    if (MaxSimultaneousTargets > 0 && CurrentTargets.Num() > MaxSimultaneousTargets)
+    {
+        CurrentTargets.Sort([this](AActor* A, AActor* B)
+        {
+            return EvaluateThreatLevel(A) > EvaluateThreatLevel(B);
+        });
+
+        CurrentTargets.SetNum(MaxSimultaneousTargets);
+    }
 }
 
 // 위협 테이블 정리
@@ -1167,8 +1178,47 @@ AActor* AHSBossAIController::SelectTargetByStrategy()
         }
         
     case EBossTargetStrategy::SpecificRole:
-        // 특정 역할 우선 (예: 힐러, 딜러 등) - 추후 구현
-        return CurrentTargets[0];
+        {
+            if (PreferredTargetRoles.Num() > 0)
+            {
+                for (EHSPlayerRole PreferredRole : PreferredTargetRoles)
+                {
+                    AActor* MatchingTarget = nullptr;
+                    float BestThreat = -FLT_MAX;
+
+                    for (AActor* Target : CurrentTargets)
+                    {
+                        if (!Target)
+                        {
+                            continue;
+                        }
+
+                        if (const AHSPlayerCharacter* PlayerChar = Cast<AHSPlayerCharacter>(Target))
+                        {
+                            if (const AHSPlayerState* PlayerState = PlayerChar->GetPlayerState<AHSPlayerState>())
+                            {
+                                if (PlayerState->GetPlayerRole() == PreferredRole)
+                                {
+                                    float Threat = EvaluateThreatLevel(Target);
+                                    if (Threat > BestThreat)
+                                    {
+                                        BestThreat = Threat;
+                                        MatchingTarget = Target;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if (MatchingTarget)
+                    {
+                        return MatchingTarget;
+                    }
+                }
+            }
+
+            return CurrentTargets[0];
+        }
         
     default:
         return CurrentTargets[0];

@@ -1,5 +1,4 @@
 // 사냥의 영혼(HuntingSpirit) 게임의 팀 관리자 클래스 구현
-// 현업 최적화 기법 적용: 메모리 풀링, 캐시 친화적 설계, SIMD 최적화
 
 #include "HSTeamManager.h"
 #include "Engine/Engine.h"
@@ -9,11 +8,16 @@
 #include "GameFramework/PlayerState.h"
 #include "../Core/PlayerController/HSPlayerController.h"
 #include "../Characters/Player/HSPlayerCharacter.h"
+#include "../Characters/Stats/HSStatsComponent.h"
+#include "../Characters/Stats/HSLevelSystem.h"
+#include "../Combat/HSCombatComponent.h"
 #include "Net/UnrealNetwork.h"
 #include "Engine/NetConnection.h"
 #include "Kismet/GameplayStatics.h"
+#include "GameFramework/Controller.h"
+#include "GameFramework/PlayerController.h"
+#include "Containers/Set.h"
 
-// 현업 최적화: SIMD 벡터 연산을 위한 헤더
 #include "Math/Vector.h"
 #include "HAL/PlatformMath.h"
 
@@ -538,33 +542,54 @@ bool UHSTeamManager::IsPlayerTeamLeader(APlayerState* PlayerState) const
 
 void UHSTeamManager::BroadcastMessageToTeam(int32 TeamID, const FString& Message, bool bIncludeLeader)
 {
+    if (Message.IsEmpty())
+    {
+        return;
+    }
+
     const FHSTeamInfo TeamInfo = GetTeamInfo(TeamID);
     if (!TeamInfo.bIsActive)
     {
         return;
     }
 
-    // 팀 리더에게 전송
-    if (bIncludeLeader && TeamInfo.TeamLeader.IsValid())
+    TSet<const APlayerState*> ProcessedPlayers;
+    const auto SendToPlayer = [&](const TWeakObjectPtr<APlayerState>& PlayerPtr)
     {
-        if (AHSPlayerController* PC = Cast<AHSPlayerController>(TeamInfo.TeamLeader->GetOwner()))
+        if (!PlayerPtr.IsValid())
         {
-            // 여기서 플레이어에게 메시지를 전송하는 로직 구현
-            // 예: PC->ReceiveTeamMessage(Message);
+            return;
         }
-    }
 
-    // 팀원들에게 전송
-    for (const TWeakObjectPtr<APlayerState>& Member : TeamInfo.TeamMembers)
-    {
-        if (Member.IsValid())
+        APlayerState* PlayerState = PlayerPtr.Get();
+        if (ProcessedPlayers.Contains(PlayerState))
         {
-            if (AHSPlayerController* PC = Cast<AHSPlayerController>(Member->GetOwner()))
+            return;
+        }
+
+        if (AController* OwnerController = Cast<AController>(PlayerState->GetOwner()))
+        {
+            if (AHSPlayerController* HSController = Cast<AHSPlayerController>(OwnerController))
             {
-                // 여기서 플레이어에게 메시지를 전송하는 로직 구현
-                // 예: PC->ReceiveTeamMessage(Message);
+                HSController->ClientMessage(Message);
+            }
+            else if (APlayerController* PlayerController = Cast<APlayerController>(OwnerController))
+            {
+                PlayerController->ClientMessage(Message);
             }
         }
+
+        ProcessedPlayers.Add(PlayerState);
+    };
+
+    if (bIncludeLeader)
+    {
+        SendToPlayer(TeamInfo.TeamLeader);
+    }
+
+    for (const TWeakObjectPtr<APlayerState>& Member : TeamInfo.TeamMembers)
+    {
+        SendToPlayer(Member);
     }
 
     UE_LOG(LogHSTeamManager, Log, TEXT("팀 %d에 메시지 브로드캐스트: %s"), TeamID, *Message);
@@ -580,35 +605,52 @@ float UHSTeamManager::GetTeamAverageLevel(int32 TeamID) const
 
     float TotalLevel = 0.0f;
     int32 ValidPlayerCount = 0;
+    TSet<const APlayerState*> ProcessedPlayers;
 
-    // 리더 레벨 추가
-    if (TeamInfo.TeamLeader.IsValid())
+    const auto AccumulateLevel = [&](const TWeakObjectPtr<APlayerState>& PlayerPtr)
     {
-        if (AHSPlayerCharacter* PlayerChar = Cast<AHSPlayerCharacter>(TeamInfo.TeamLeader->GetPawn()))
+        if (!PlayerPtr.IsValid())
         {
-            // 여기서 플레이어 레벨을 가져오는 로직 구현
-            // 예: TotalLevel += PlayerChar->GetPlayerLevel();
-            TotalLevel += 1.0f; // 임시값
-            ValidPlayerCount++;
+            return;
         }
-    }
 
-    // 팀원 레벨 추가
-    for (const TWeakObjectPtr<APlayerState>& Member : TeamInfo.TeamMembers)
-    {
-        if (Member.IsValid())
+        APlayerState* PlayerState = PlayerPtr.Get();
+        if (ProcessedPlayers.Contains(PlayerState))
         {
-            if (AHSPlayerCharacter* PlayerChar = Cast<AHSPlayerCharacter>(Member->GetPawn()))
+            return;
+        }
+
+        ProcessedPlayers.Add(PlayerState);
+
+        if (APawn* PlayerPawn = PlayerState->GetPawn())
+        {
+            if (AHSPlayerCharacter* PlayerCharacter = Cast<AHSPlayerCharacter>(PlayerPawn))
             {
-                // 여기서 플레이어 레벨을 가져오는 로직 구현
-                // 예: TotalLevel += PlayerChar->GetPlayerLevel();
-                TotalLevel += 1.0f; // 임시값
-                ValidPlayerCount++;
+                if (UHSStatsComponent* StatsComponent = PlayerCharacter->GetStatsComponent())
+                {
+                    if (UHSLevelSystem* LevelSystem = StatsComponent->GetLevelSystem())
+                    {
+                        TotalLevel += static_cast<float>(LevelSystem->GetCurrentLevel());
+                        ValidPlayerCount++;
+                    }
+                }
             }
         }
+    };
+
+    AccumulateLevel(TeamInfo.TeamLeader);
+
+    for (const TWeakObjectPtr<APlayerState>& Member : TeamInfo.TeamMembers)
+    {
+        AccumulateLevel(Member);
     }
 
-    return ValidPlayerCount > 0 ? TotalLevel / ValidPlayerCount : 0.0f;
+    if (ValidPlayerCount == 0)
+    {
+        return static_cast<float>(TeamInfo.TeamLevel);
+    }
+
+    return TotalLevel / ValidPlayerCount;
 }
 
 float UHSTeamManager::GetTeamTotalHealth(int32 TeamID) const
@@ -620,30 +662,46 @@ float UHSTeamManager::GetTeamTotalHealth(int32 TeamID) const
     }
 
     float TotalHealth = 0.0f;
+    TSet<const APlayerState*> ProcessedPlayers;
 
-    // 리더 체력 추가
-    if (TeamInfo.TeamLeader.IsValid())
+    const auto AccumulateHealth = [&](const TWeakObjectPtr<APlayerState>& PlayerPtr)
     {
-        if (AHSPlayerCharacter* PlayerChar = Cast<AHSPlayerCharacter>(TeamInfo.TeamLeader->GetPawn()))
+        if (!PlayerPtr.IsValid())
         {
-            // 여기서 플레이어 체력을 가져오는 로직 구현
-            // 예: TotalHealth += PlayerChar->GetCurrentHealth();
-            TotalHealth += 100.0f; // 임시값
+            return;
         }
-    }
 
-    // 팀원 체력 추가
-    for (const TWeakObjectPtr<APlayerState>& Member : TeamInfo.TeamMembers)
-    {
-        if (Member.IsValid())
+        APlayerState* PlayerState = PlayerPtr.Get();
+        if (ProcessedPlayers.Contains(PlayerState))
         {
-            if (AHSPlayerCharacter* PlayerChar = Cast<AHSPlayerCharacter>(Member->GetPawn()))
+            return;
+        }
+
+        ProcessedPlayers.Add(PlayerState);
+
+        if (APawn* PlayerPawn = PlayerState->GetPawn())
+        {
+            if (AHSPlayerCharacter* PlayerCharacter = Cast<AHSPlayerCharacter>(PlayerPawn))
             {
-                // 여기서 플레이어 체력을 가져오는 로직 구현
-                // 예: TotalHealth += PlayerChar->GetCurrentHealth();
-                TotalHealth += 100.0f; // 임시값
+                if (UHSStatsComponent* StatsComponent = PlayerCharacter->GetStatsComponent())
+                {
+                    TotalHealth += StatsComponent->GetCurrentHealth();
+                    return;
+                }
+
+                if (UHSCombatComponent* CombatComponent = PlayerCharacter->FindComponentByClass<UHSCombatComponent>())
+                {
+                    TotalHealth += CombatComponent->GetCurrentHealth();
+                }
             }
         }
+    };
+
+    AccumulateHealth(TeamInfo.TeamLeader);
+
+    for (const TWeakObjectPtr<APlayerState>& Member : TeamInfo.TeamMembers)
+    {
+        AccumulateHealth(Member);
     }
 
     return TotalHealth;

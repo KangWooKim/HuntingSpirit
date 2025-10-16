@@ -395,11 +395,11 @@ private:
     // 플레이어 음성 상태 업데이트
     void UpdatePlayerVoiceState(int32 PlayerID, EHSVoiceChatState NewState);
 
-    // 현업 최적화: 메시지 풀링
+    // 메시지 풀링
     UPROPERTY()
     TArray<FHSChatMessage> MessagePool;
 
-    // 현업 최적화: 핑 풀링
+    // 핑 풀링
     UPROPERTY()
     TArray<FHSPingData> PingPool;
 

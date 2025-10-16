@@ -12,6 +12,8 @@
 #include "Engine/World.h"
 #include "TimerManager.h"
 #include "HuntingSpirit/Combat/Projectiles/HSMagicProjectile.h"
+#include "HuntingSpirit/Characters/Stats/HSStatsComponent.h"
+#include "HuntingSpirit/Characters/Stats/HSAttributeSet.h"
 
 // 생성자
 AHSMageCharacter::AHSMageCharacter()
@@ -453,17 +455,21 @@ void AHSMageCharacter::CycleMagicType()
 // 마법사 특화 스탯 설정
 void AHSMageCharacter::SetupMageStats()
 {
-    // 예시: 체력, 마나, 마법 공격력 등 스탯 설정
-    /*
-    if (StatsComponent)
+    if (UHSStatsComponent* Stats = GetStatsComponent())
     {
-        StatsComponent->SetMaxHealth(80.0f);     // 낮은 체력
-        StatsComponent->SetMaxMana(150.0f);      // 높은 마나
-        StatsComponent->SetDefense(10.0f);       // 낮은 방어력
-        StatsComponent->SetMagicalPower(60.0f);  // 높은 마법 공격력
-        StatsComponent->SetAttackSpeed(0.9f);    // 느린 공격 속도
+        Stats->InitializeStatsForClass(TEXT("Mage"));
+        Stats->EnableAutoRegeneration(false, true, true);
+
+        if (UHSAttributeSet* Attributes = Stats->GetAttributeSet())
+        {
+            Attributes->SetMovementSpeed(GetCharacterMovement()->MaxWalkSpeed);
+
+            MaxHealth = Attributes->GetMaxHealth();
+            Health = Attributes->GetHealth();
+            StaminaMax = Attributes->GetMaxStamina();
+            StaminaCurrent = StaminaMax;
+        }
     }
-    */
 }
 
 // 스킬 초기화

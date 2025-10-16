@@ -1,6 +1,4 @@
 // HuntingSpirit 게임의 보상 분배 시스템 구현
-// 기여도 추적, 공정한 보상 분배, 투표 시스템 실제 로직
-// 작성자: KangWooKim (https://github.com/KangWooKim)
 
 #include "HSRewardsSystem.h"
 #include "Engine/World.h"
@@ -14,6 +12,9 @@
 #include "HAL/PlatformFilemanager.h"
 #include "../Inventory/HSInventoryComponent.h"
 #include "../../Items/HSItemBase.h"
+#include "../../Characters/Player/HSPlayerCharacter.h"
+#include "../../Characters/Stats/HSStatsComponent.h"
+#include "../../Characters/Stats/HSLevelSystem.h"
 
 UHSRewardsSystem::UHSRewardsSystem()
 {
@@ -158,7 +159,7 @@ void UHSRewardsSystem::AddContribution(int32 PlayerID, EHSContributionType Contr
 
 FHSPlayerContribution UHSRewardsSystem::GetPlayerContribution(int32 PlayerID) const
 {
-    // 현업 최적화: 캐시 먼저 확인
+    // 캐시 먼저 확인
     if (const FHSPlayerContribution* CachedContribution = ContributionCache.Find(PlayerID))
     {
         FDateTime CurrentTime = FDateTime::Now();
@@ -168,7 +169,7 @@ FHSPlayerContribution UHSRewardsSystem::GetPlayerContribution(int32 PlayerID) co
         }
     }
     
-    // 캐시 미스 또는 만료된 경우 실제 데이터 조회
+    // 캐시 미스 또는 만료된 경우 데이터 조회
     if (const FHSPlayerContribution* Contribution = PlayerContributions.Find(PlayerID))
     {
         // 캐시 업데이트 (mutable 변수 직접 수정)
@@ -413,7 +414,7 @@ TArray<FHSDistributionResult> UHSRewardsSystem::DistributeEqually(const TArray<F
         int32 RecipientIndex = RewardIndex % PlayerCount;
         int32 RecipientPlayerID = PlayerIDs[RecipientIndex];
         
-        // 현업 최적화: 오브젝트 풀링 사용
+        // 결과 객체 재사용을 위해 오브젝트 풀링 활용
         FHSDistributionResult* Result = nullptr;
         if (ResultPool.Num() > 0)
         {
@@ -789,7 +790,7 @@ float UHSRewardsSystem::CalculateFairnessIndex() const
 
 float UHSRewardsSystem::CalculateRewardValue(const FHSRewardItem& Reward) const
 {
-    // 현업 최적화: 값 캐싱
+    // 값 캐싱
     if (const float* CachedValue = RewardValueCache.Find(Reward.ItemID))
     {
         return *CachedValue;
@@ -838,7 +839,6 @@ float UHSRewardsSystem::CalculateRewardValue(const FHSRewardItem& Reward) const
 
 float UHSRewardsSystem::AnalyzePlayerNeed(int32 PlayerID, const FHSRewardItem& Reward) const
 {
-    // 현업 최적화: 캐시 사용
     TTuple<int32, FName> CacheKey = MakeTuple(PlayerID, Reward.ItemID);
     if (const float* CachedNeed = NeedAnalysisCache.Find(CacheKey))
     {
@@ -846,26 +846,57 @@ float UHSRewardsSystem::AnalyzePlayerNeed(int32 PlayerID, const FHSRewardItem& R
     }
     
     float NeedScore = 0.0f;
-    
-    // 플레이어의 인벤토리 상태 분석 (실제 구현에서는 InventoryComponent 참조)
-    // 현재는 간단한 계산으로 대체
-    
-    // 기본 필요도 (보상 타입별)
+
+    const AHSPlayerCharacter* PlayerCharacter = nullptr;
+    const UHSInventoryComponent* InventoryComponent = nullptr;
+    const UHSStatsComponent* StatsComponent = nullptr;
+    const UHSLevelSystem* LevelSystem = nullptr;
+
+    if (UWorld* World = GetWorld())
+    {
+        if (AGameStateBase* GameState = World->GetGameState())
+        {
+            for (APlayerState* PS : GameState->PlayerArray)
+            {
+                if (PS && PS->GetPlayerId() == PlayerID)
+                {
+                    if (APawn* Pawn = PS->GetPawn())
+                    {
+                        PlayerCharacter = Cast<AHSPlayerCharacter>(Pawn);
+                        if (PlayerCharacter)
+                        {
+                            InventoryComponent = PlayerCharacter->GetInventoryComponent();
+                            StatsComponent = PlayerCharacter->GetStatsComponent();
+                            LevelSystem = StatsComponent ? StatsComponent->GetLevelSystem() : nullptr;
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    // 기본 필요도 (보상 타입별) 계산
     switch (Reward.RewardType)
     {
         case EHSRewardType::Item:
-            // 희귀한 아이템일수록 높은 필요도
             NeedScore = 0.5f + (Reward.Rarity * 0.1f);
             break;
             
         case EHSRewardType::Currency:
-            // 화폐는 항상 필요
-            NeedScore = 0.8f;
+            NeedScore = 0.7f;
             break;
             
         case EHSRewardType::Experience:
-            // 경험치는 낮은 레벨일수록 더 필요
             NeedScore = 0.6f;
+            if (LevelSystem)
+            {
+                const int32 PlayerLevel = LevelSystem->GetCurrentLevel();
+                const float LevelProgress = LevelSystem->GetLevelProgress();
+                const float LevelFactor = FMath::Clamp(1.0f - static_cast<float>(PlayerLevel) / 60.0f, 0.3f, 1.0f);
+                const float ProgressFactor = 0.5f + (1.0f - LevelProgress) * 0.5f;
+                NeedScore = FMath::Clamp(LevelFactor * ProgressFactor, 0.3f, 1.0f);
+            }
             break;
             
         default:
@@ -877,13 +908,75 @@ float UHSRewardsSystem::AnalyzePlayerNeed(int32 PlayerID, const FHSRewardItem& R
     const FHSPlayerContribution* Contribution = PlayerContributions.Find(PlayerID);
     if (Contribution)
     {
-        // 기여도가 낮은 플레이어에게 더 높은 필요도 부여 (균형 조정)
-        float ContribFactor = FMath::Clamp(1.0f - (Contribution->TotalScore / 1000.0f), 0.3f, 1.0f);
+        const float NormalizedScore = FMath::Clamp(Contribution->TotalScore, 0.0f, 1000.0f);
+        const float ContribFactor = FMath::GetMappedRangeValueClamped(FVector2D(0.0f, 1000.0f), FVector2D(1.1f, 0.6f), NormalizedScore);
         NeedScore *= ContribFactor;
     }
-    
-    // 랜덤 요소 추가 (공정성을 위해)
-    NeedScore += FMath::FRandRange(-0.1f, 0.1f);
+
+    if (InventoryComponent)
+    {
+        const FString RewardNameReference = !Reward.ItemName.IsEmpty()
+            ? Reward.ItemName
+            : Reward.ItemID.ToString();
+        const FString NormalizedRewardName = RewardNameReference.ToLower();
+
+        int32 OwnedQuantity = 0;
+        int32 CurrencyQuantity = 0;
+
+        const TArray<FHSInventorySlot> Slots = InventoryComponent->GetFilteredItems(EHSInventoryFilter::None);
+        for (const FHSInventorySlot& Slot : Slots)
+        {
+            if (!Slot.IsValid() || !Slot.Item)
+            {
+                continue;
+            }
+
+            const FString ItemNameLower = Slot.Item->GetItemName().ToLower();
+            if (!NormalizedRewardName.IsEmpty() && ItemNameLower == NormalizedRewardName)
+            {
+                OwnedQuantity += Slot.Quantity;
+            }
+
+            if (Reward.RewardType == EHSRewardType::Currency && Slot.Item->GetItemType() == EHSItemType::Currency)
+            {
+                CurrencyQuantity += Slot.Quantity;
+            }
+        }
+
+        if (Reward.RewardType == EHSRewardType::Item)
+        {
+            if (OwnedQuantity > 0)
+            {
+                const float DuplicatePenalty = FMath::Clamp(1.0f / (1.0f + OwnedQuantity), 0.25f, 1.0f);
+                NeedScore *= DuplicatePenalty;
+            }
+            else
+            {
+                const int32 EmptySlots = InventoryComponent->GetEmptySlotCount();
+                if (EmptySlots == 0)
+                {
+                    NeedScore *= 0.5f;
+                }
+            }
+        }
+        else if (Reward.RewardType == EHSRewardType::Currency)
+        {
+            const float CurrencyModifier = CurrencyQuantity > 0
+                ? FMath::Clamp(1.0f / (1.0f + CurrencyQuantity / 500.0f), 0.35f, 1.0f)
+                : 1.0f;
+            NeedScore *= CurrencyModifier;
+        }
+    }
+
+    if (StatsComponent && Reward.RewardType == EHSRewardType::Item)
+    {
+        const float HealthPercent = StatsComponent->GetHealthPercent();
+        if (HealthPercent < 0.4f)
+        {
+            NeedScore = FMath::Clamp(NeedScore + 0.15f, 0.0f, 1.0f);
+        }
+    }
+
     NeedScore = FMath::Clamp(NeedScore, 0.0f, 1.0f);
     
     // 캐시에 저장 (mutable 변수 직접 수정)

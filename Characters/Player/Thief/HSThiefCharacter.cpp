@@ -13,6 +13,8 @@
 #include "Engine/World.h"
 #include "TimerManager.h"
 #include "Materials/MaterialInstanceDynamic.h"
+#include "HuntingSpirit/Characters/Stats/HSStatsComponent.h"
+#include "HuntingSpirit/Characters/Stats/HSAttributeSet.h"
 
 // 생성자
 AHSThiefCharacter::AHSThiefCharacter()
@@ -404,17 +406,21 @@ void AHSThiefCharacter::EndMultiStrike()
 // 시프 특화 스탯 설정
 void AHSThiefCharacter::SetupThiefStats()
 {
-    // 예시: 체력, 회피력, 공격속도 등 스탯 설정
-    /*
-    if (StatsComponent)
+    if (UHSStatsComponent* Stats = GetStatsComponent())
     {
-        StatsComponent->SetMaxHealth(100.0f);    // 보통 체력
-        StatsComponent->SetDefense(15.0f);       // 낮은 방어력
-        StatsComponent->SetAttackPower(35.0f);   // 중간 공격력
-        StatsComponent->SetAttackSpeed(1.3f);    // 빠른 공격 속도
-        StatsComponent->SetCriticalChance(0.25f); // 높은 치명타 확률
+        Stats->InitializeStatsForClass(TEXT("Thief"));
+        Stats->EnableAutoRegeneration(false, true, true);
+
+        if (UHSAttributeSet* Attributes = Stats->GetAttributeSet())
+        {
+            Attributes->SetMovementSpeed(GetCharacterMovement()->MaxWalkSpeed);
+
+            MaxHealth = Attributes->GetMaxHealth();
+            Health = Attributes->GetHealth();
+            StaminaMax = Attributes->GetMaxStamina();
+            StaminaCurrent = StaminaMax;
+        }
     }
-    */
 }
 
 // 스킬 초기화

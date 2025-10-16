@@ -1,5 +1,5 @@
 // HuntingSpirit 게임의 팀 구성 시스템 구현
-// 역할 기반 팀 편성, 자동 매칭, 시너지 계산 실제 로직
+// 역할 기반 팀 편성, 자동 매칭, 시너지 계산 로직
 // 작성자: KangWooKim (https://github.com/KangWooKim)
 
 #include "HSTeamFormationSystem.h"
@@ -689,7 +689,7 @@ TArray<FHSMatchingRequest> UHSTeamFormationSystem::GetActiveMatchingRequests() c
 
 TArray<FHSPlayerSkillInfo> UHSTeamFormationSystem::FindCompatiblePlayers(const FHSTeamRequirements& Requirements) const
 {
-    // 현업 최적화: 캐시 확인
+    // 캐시 확인
     FString CacheKey = FString::Printf(TEXT("Compatible_%d_%d_%d"), 
                                       Requirements.MinLevel, Requirements.MaxLevel, (int32)Requirements.PreferredStrategy);
     
@@ -832,7 +832,7 @@ float UHSTeamFormationSystem::CalculateTeamSynergy(const TArray<FHSPlayerSkillIn
         return 0.0f;
     }
     
-    // 현업 최적화: 캐시 확인
+    // 캐시 확인
     // 테팀 시너지 계산을 위한 해시 생성 (PlayerID 배열로 변환)
     TArray<int32> PlayerIDs;
     for (const FHSPlayerSkillInfo& Member : TeamMembers)
@@ -1021,7 +1021,7 @@ TMap<EHSTeamRole, int32> UHSTeamFormationSystem::AnalyzeRoleShortage() const
 
 float UHSTeamFormationSystem::CalculatePlayerCompatibility(int32 PlayerID1, int32 PlayerID2) const
 {
-    // 현업 최적화: 캐시 확인
+    // 캐시 확인
     TTuple<int32, int32> CacheKey = MakeTuple(FMath::Min(PlayerID1, PlayerID2), FMath::Max(PlayerID1, PlayerID2));
     if (const float* CachedCompatibility = CompatibilityCache.Find(CacheKey))
     {

@@ -597,22 +597,23 @@ FName AHSWeaponBase::GetWeaponSocketName() const
 // 상호작용 구체 오버랩 시작
 void AHSWeaponBase::OnInteractionSphereBeginOverlap(UPrimitiveComponent* OverlappedComponent, AActor* OtherActor, UPrimitiveComponent* OtherComp, int32 OtherBodyIndex, bool bFromSweep, const FHitResult& SweepResult)
 {
-    // 플레이어 캐릭터가 근처에 왔을 때의 처리
     AHSCharacterBase* Character = Cast<AHSCharacterBase>(OtherActor);
-    if (Character && Character->IsPlayerControlled() && WeaponState == EHSWeaponState::Dropped)
+    if (!Character || !Character->IsPlayerControlled() || WeaponState != EHSWeaponState::Dropped)
     {
-        // UI에 상호작용 프롬프트 표시 등의 로직 추가 가능
-        // 예: "E키를 눌러 무기 획득"
+        return;
     }
+
+    // 상호작용 안내, UI 연동 등은 별도 시스템에서 처리
 }
 
 // 상호작용 구체 오버랩 종료
 void AHSWeaponBase::OnInteractionSphereEndOverlap(UPrimitiveComponent* OverlappedComponent, AActor* OtherActor, UPrimitiveComponent* OtherComp, int32 OtherBodyIndex)
 {
-    // 플레이어 캐릭터가 멀어졌을 때의 처리
     AHSCharacterBase* Character = Cast<AHSCharacterBase>(OtherActor);
-    if (Character && Character->IsPlayerControlled())
+    if (!Character || !Character->IsPlayerControlled())
     {
-        // UI에서 상호작용 프롬프트 숨김 등의 로직 추가 가능
+        return;
     }
+
+    // 상호작용 해제 관련 처리는 UI 시스템에서 담당
 }

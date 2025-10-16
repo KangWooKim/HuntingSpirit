@@ -22,6 +22,7 @@ class UAISenseConfig_Hearing;
 class UAISenseConfig_Damage;
 class UHSBossPhaseSystem;
 class UHSBossAbilitySystem;
+enum class EHSPlayerRole : uint8;
 
 // 보스 AI 상태
 UENUM(BlueprintType)
@@ -214,6 +215,9 @@ protected:
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Boss AI|Target")
     EBossTargetStrategy TargetStrategy;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Boss AI|Target")
+    TArray<EHSPlayerRole> PreferredTargetRoles;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Boss AI|Target")
     float TargetSwitchInterval = 5.0f;

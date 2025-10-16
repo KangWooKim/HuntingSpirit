@@ -11,6 +11,8 @@
 #include "Components/CapsuleComponent.h"
 #include "Engine/World.h"
 #include "TimerManager.h"
+#include "HuntingSpirit/Characters/Stats/HSStatsComponent.h"
+#include "HuntingSpirit/Characters/Stats/HSAttributeSet.h"
 
 // 생성자
 AHSWarriorCharacter::AHSWarriorCharacter()
@@ -320,17 +322,21 @@ void AHSWarriorCharacter::EndBerserkerMode()
 // 전사 특화 스탯 설정
 void AHSWarriorCharacter::SetupWarriorStats()
 {
-    // 예시: 체력, 방어력, 공격력 등 스탯 설정
-    // 스탯 시스템이 구현되면 활용할 수 있는 코드
-    /*
-    if (StatsComponent)
+    if (UHSStatsComponent* Stats = GetStatsComponent())
     {
-        StatsComponent->SetMaxHealth(150.0f);    // 높은 최대 체력
-        StatsComponent->SetDefense(30.0f);       // 높은 방어력
-        StatsComponent->SetAttackPower(40.0f);   // 중간 공격력
-        StatsComponent->SetAttackSpeed(0.8f);    // 느린 공격 속도
+        Stats->InitializeStatsForClass(TEXT("Warrior"));
+        Stats->EnableAutoRegeneration(true, false, true);
+
+        if (UHSAttributeSet* Attributes = Stats->GetAttributeSet())
+        {
+            Attributes->SetMovementSpeed(GetCharacterMovement()->MaxWalkSpeed);
+
+            MaxHealth = Attributes->GetMaxHealth();
+            Health = Attributes->GetHealth();
+            StaminaMax = Attributes->GetMaxStamina();
+            StaminaCurrent = StaminaMax;
+        }
     }
-    */
 }
 
 // 스킬 초기화

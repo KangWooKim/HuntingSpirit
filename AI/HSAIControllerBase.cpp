@@ -14,6 +14,8 @@
 #include "HuntingSpirit/World/Navigation/HSNavigationIntegration.h"
 #include "BehaviorTree/BehaviorTreeComponent.h"
 #include "BehaviorTree/BlackboardComponent.h"
+#include "BehaviorTree/BehaviorTree.h"
+#include "BehaviorTree/BlackboardData.h"
 #include "Perception/AIPerceptionComponent.h"
 #include "Perception/AISenseConfig_Sight.h"
 #include "Perception/AISenseConfig_Hearing.h"
@@ -25,8 +27,10 @@
 #include "Kismet/KismetSystemLibrary.h"
 #include "Engine/World.h"
 #include "Engine/GameInstance.h"
+#include "BrainComponent.h"
 #include "DrawDebugHelpers.h"
 #include "TimerManager.h"
+#include "UObject/UObjectGlobals.h"
 
 /**
  * @brief 기본 생성자 구현
@@ -34,6 +38,8 @@
  */
 AHSAIControllerBase::AHSAIControllerBase()
 {
+    PrimaryActorTick.bCanEverTick = true;
+
     // 비헤이비어 트리 컴포넌트 생성
     BehaviorTreeComponent = CreateDefaultSubobject<UBehaviorTreeComponent>(TEXT("BehaviorTreeComponent"));
 
@@ -89,6 +95,7 @@ void AHSAIControllerBase::BeginPlay()
         AIPerceptionComponent->OnPerceptionUpdated.AddDynamic(this, &AHSAIControllerBase::OnPerceptionUpdated);
         AIPerceptionComponent->OnTargetPerceptionUpdated.AddDynamic(this, &AHSAIControllerBase::OnTargetPerceptionUpdated);
         AIPerceptionComponent->OnTargetPerceptionForgotten.AddDynamic(this, &AHSAIControllerBase::OnTargetPerceptionForgotten);
+        AIPerceptionComponent->RequestStimuliListenerUpdate();
     }
     
     // === 네비게이션 시스템 통합 초기화 ===
@@ -106,20 +113,54 @@ void AHSAIControllerBase::BeginPlay()
     StartAI();
 }
 
+void AHSAIControllerBase::Tick(float DeltaSeconds)
+{
+    Super::Tick(DeltaSeconds);
+
+    UpdateStuckDetection();
+
+    if (bShowNavigationDebug && !bShowDebugInfo)
+    {
+        DrawNavigationDebug();
+    }
+}
+
 /**
  * @brief AI 시작 구현
  * @details 폰을 캐시하고 블루프린트 이벤트를 호출합니다
  */
 void AHSAIControllerBase::StartAI()
 {
-    if (GetPawn())
+    APawn* ControlledPawn = GetPawn();
+    if (!ControlledPawn)
     {
-        // 오너 적 캐릭터 캐시
-        OwnerEnemy = Cast<AHSEnemyBase>(GetPawn());
-        
-        // 블루프린트 이벤트 호출
-        OnPawnPossessed(GetPawn());
+        return;
     }
+
+    // 오너 적 캐릭터 캐시
+    OwnerEnemy = Cast<AHSEnemyBase>(ControlledPawn);
+
+    UBehaviorTree* BehaviorTreeToRun = nullptr;
+    if (OwnerEnemy)
+    {
+        BehaviorTreeToRun = OwnerEnemy->BehaviorTree;
+    }
+
+    if (BehaviorTreeToRun)
+    {
+        if (BlackboardComponent && BehaviorTreeToRun->BlackboardAsset)
+        {
+            if (!BlackboardComponent->IsInitialized())
+            {
+                UseBlackboard(BehaviorTreeToRun->BlackboardAsset, BlackboardComponent);
+            }
+        }
+
+        RunBehaviorTree(BehaviorTreeToRun);
+    }
+
+    // 블루프린트 이벤트 호출
+    OnPawnPossessed(ControlledPawn);
 }
 
 /**
@@ -130,8 +171,27 @@ void AHSAIControllerBase::StopAI()
 {
     // 네비게이션 시스템에서 등록 해제
     UnregisterFromNavigationSystem();
-    
-    // 오너 캐맭터 참조 해제
+
+    if (BehaviorTreeComponent)
+    {
+        BehaviorTreeComponent->StopTree(EBTStopMode::Safe);
+    }
+
+    if (BrainComponent)
+    {
+        BrainComponent->StopLogic(TEXT("StopAI"));
+    }
+
+    StopMovement();
+
+    if (BlackboardComponent && BlackboardComponent->HasValidAsset())
+    {
+        BlackboardComponent->ClearAllValues();
+    }
+
+    SetCurrentTarget(nullptr);
+
+    // 오너 캐릭터 참조 해제
     OwnerEnemy = nullptr;
 }
 
@@ -321,8 +381,6 @@ void AHSAIControllerBase::DrawDebugInfo(float Duration)
     
     // 시야각 그리기
     FVector ForwardVector = GetPawn()->GetActorForwardVector();
-    float HalfAngleRad = FMath::DegreesToRadians(SightAngleDegrees * 0.5f);
-    
     FVector LeftDirection = ForwardVector.RotateAngleAxis(-SightAngleDegrees * 0.5f, FVector::UpVector);
     FVector RightDirection = ForwardVector.RotateAngleAxis(SightAngleDegrees * 0.5f, FVector::UpVector);
     
@@ -371,7 +429,10 @@ void AHSAIControllerBase::SetupAIPerception()
 // 시각 감지 설정
 void AHSAIControllerBase::SetupSightSense()
 {
-    SightConfig = CreateDefaultSubobject<UAISenseConfig_Sight>(TEXT("SightConfig"));
+    if (!SightConfig)
+    {
+        SightConfig = NewObject<UAISenseConfig_Sight>(this, TEXT("SightConfig"));
+    }
     if (SightConfig)
     {
         SightConfig->SightRadius = SightRadius;
@@ -392,7 +453,10 @@ void AHSAIControllerBase::SetupSightSense()
 // 청각 감지 설정
 void AHSAIControllerBase::SetupHearingSense()
 {
-    HearingConfig = CreateDefaultSubobject<UAISenseConfig_Hearing>(TEXT("HearingConfig"));
+    if (!HearingConfig)
+    {
+        HearingConfig = NewObject<UAISenseConfig_Hearing>(this, TEXT("HearingConfig"));
+    }
     if (HearingConfig)
     {
         HearingConfig->HearingRange = HearingRadius;
@@ -410,7 +474,10 @@ void AHSAIControllerBase::SetupHearingSense()
 // 데미지 감지 설정
 void AHSAIControllerBase::SetupDamageSense()
 {
-    DamageConfig = CreateDefaultSubobject<UAISenseConfig_Damage>(TEXT("DamageConfig"));
+    if (!DamageConfig)
+    {
+        DamageConfig = NewObject<UAISenseConfig_Damage>(this, TEXT("DamageConfig"));
+    }
     if (DamageConfig)
     {
         DamageConfig->SetMaxAge(MaxAge);
@@ -523,6 +590,7 @@ EHSNavigationRequestResult AHSAIControllerBase::MoveToLocationAdvanced(const FVe
             MoveRequest.SetGoalLocation(TargetLocation);
             MoveRequest.SetAcceptanceRadius(AcceptanceRadius);
             MoveRequest.SetCanStrafe(bCanStrafe);
+            MoveRequest.SetStopOnOverlap(bStopOnOverlap);
             MoveRequest.SetUsePathfinding(bUsePathfinding);
             
             FPathFollowingRequestResult RequestResult = MoveTo(MoveRequest);
@@ -549,6 +617,7 @@ EHSNavigationRequestResult AHSAIControllerBase::MoveToLocationAdvanced(const FVe
         MoveRequest.SetGoalLocation(TargetLocation);
         MoveRequest.SetAcceptanceRadius(AcceptanceRadius);
         MoveRequest.SetCanStrafe(bCanStrafe);
+        MoveRequest.SetStopOnOverlap(bStopOnOverlap);
         MoveRequest.SetUsePathfinding(bUsePathfinding);
         
         FPathFollowingRequestResult RequestResult = MoveTo(MoveRequest);
@@ -741,9 +810,9 @@ void AHSAIControllerBase::InitializeNavigationSystem()
     }
     
     // 네비게이션 통합 컴포넌트 찾기
-    if (AActor* OwnerActor = GetOwner())
+    if (APawn* ControlledPawn = GetPawn())
     {
-        NavigationIntegration = OwnerActor->FindComponentByClass<UHSNavigationIntegration>();
+        NavigationIntegration = ControlledPawn->FindComponentByClass<UHSNavigationIntegration>();
     }
     
     // 자동 등록 실행

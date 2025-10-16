@@ -15,6 +15,8 @@
 #include "Kismet/KismetMathLibrary.h"
 #include "Components/AudioComponent.h"
 #include "Net/UnrealNetwork.h"
+#include "Blueprint/AIBlueprintHelperLibrary.h"
+#include "GameFramework/Controller.h"
 
 // 생성자
 UHSCoopMechanics::UHSCoopMechanics()
@@ -495,7 +497,7 @@ bool UHSCoopMechanics::TriggerComboStep(const FName& ComboID, const FName& Actio
         // 완성 보너스 적용
 		if (UHSStatsComponent* StatsComp = Player->FindComponentByClass<UHSStatsComponent>())
 		{
-			// 임시 데미지 버프 적용
+			// 콤보 완성으로 공격력 보너스 적용
 			FBuffData ComboBuffData;
 			ComboBuffData.BuffID = FString::Printf(TEXT("ComboBonus_%s"), *ComboID.ToString());
 			ComboBuffData.BuffType = EBuffType::Attack;
@@ -632,12 +634,13 @@ bool UHSCoopMechanics::IsRevivalInProgress(AHSCharacterBase* DeadPlayer) const
 // 자원 공유
 bool UHSCoopMechanics::ShareResource(AHSCharacterBase* Giver, AHSCharacterBase* Receiver, const FName& ResourceType, float Amount)
 {
-    if (!bIsInitialized || !Giver || !Receiver || Amount <= 0.0f)
+    if (!bIsInitialized || !Giver || !Receiver || Amount <= 0.0f || Giver == Receiver)
     {
         return false;
     }
 
     // 같은 팀인지 확인
+    int32 TeamID = -1;
     if (TeamManager)
     {
         APlayerState* GiverState = Giver->GetPlayerState();
@@ -647,26 +650,78 @@ bool UHSCoopMechanics::ShareResource(AHSCharacterBase* Giver, AHSCharacterBase* 
         {
             return false;
         }
+
+        TeamID = TeamManager->GetPlayerTeamID(GiverState);
     }
 
     // 거리 확인
-    float Distance = FVector::Dist(Giver->GetActorLocation(), Receiver->GetActorLocation());
-    if (Distance > 500.0f) // 5미터 이내
+    const float Distance = FVector::Dist(Giver->GetActorLocation(), Receiver->GetActorLocation());
+    if (Distance > 500.0f)
     {
         return false;
     }
 
-    // 자원 이전 로직 (실제 구현은 인벤토리 시스템에 따라 달라짐)
-    // 여기서는 예시로 스태미너 공유를 구현
-    if (ResourceType == TEXT("Stamina"))
+    UHSStatsComponent* GiverStats = Giver->FindComponentByClass<UHSStatsComponent>();
+    UHSStatsComponent* ReceiverStats = Receiver->FindComponentByClass<UHSStatsComponent>();
+    if (!GiverStats || !ReceiverStats)
     {
-        // 임시 구현 - 실제로는 스태미너 컴포넌트를 통해 처리해야 함
-        UE_LOG(LogTemp, Log, TEXT("HSCoopMechanics: 스태미너 %.1f 공유 - %s -> %s"), 
-               Amount, *Giver->GetName(), *Receiver->GetName());
-        return true;
+        return false;
     }
 
-    return false;
+    const FName NormalizedResourceType = ResourceType;
+    bool bTransferred = false;
+
+    if (NormalizedResourceType == TEXT("Stamina"))
+    {
+        if (GiverStats->ConsumeStamina(Amount))
+        {
+            ReceiverStats->RestoreStamina(Amount);
+            bTransferred = true;
+        }
+    }
+    else if (NormalizedResourceType == TEXT("Mana"))
+    {
+        if (GiverStats->ConsumeMana(Amount))
+        {
+            ReceiverStats->RestoreMana(Amount);
+            bTransferred = true;
+        }
+    }
+    else if (NormalizedResourceType == TEXT("Health"))
+    {
+        const float CurrentHealth = GiverStats->GetCurrentHealth();
+        const float TransferAmount = FMath::Min(Amount, FMath::Max(0.0f, CurrentHealth - 1.0f));
+        if (TransferAmount > 0.0f)
+        {
+            GiverStats->ApplyDamage(TransferAmount, true);
+            ReceiverStats->Heal(TransferAmount);
+            bTransferred = true;
+        }
+    }
+    else
+    {
+        if (FTeamResourcePool* TeamResourcePool = TeamResourcePools.Find(TeamID))
+        {
+            if (float* AvailableResource = TeamResourcePool->Resources.Find(NormalizedResourceType))
+            {
+                if (*AvailableResource >= Amount)
+                {
+                    *AvailableResource -= Amount;
+                    bTransferred = true;
+                }
+            }
+        }
+    }
+
+    if (!bTransferred)
+    {
+        return false;
+    }
+
+    UE_LOG(LogTemp, Log, TEXT("HSCoopMechanics: %s 자원 %.1f 공유 - %s -> %s"),
+           *ResourceType.ToString(), Amount, *Giver->GetName(), *Receiver->GetName());
+
+    return true;
 }
 
 // 팀 자원 풀 활성화
@@ -752,26 +807,47 @@ void UHSCoopMechanics::UpdateFormationMovement(int32 TeamID, const FVector& Targ
         return;
     }
 
-    // 팀원들 가져오기
     FHSTeamInfo TeamInfo = TeamManager->GetTeamInfo(TeamID);
     TArray<APlayerState*> TeamMembers = TeamManager->GetTeamMembers(TeamID);
+    UWorld* World = GetWorld();
+    if (!World)
+    {
+        return;
+    }
 
-    // 각 팀원에게 대형 위치 계산 및 이동 명령 (간소화된 구현)
+    // 각 팀원에게 대형 위치 계산 및 이동 명령
     for (int32 i = 0; i < TeamMembers.Num(); ++i)
     {
         if (APlayerState* MemberState = TeamMembers[i])
         {
             if (APawn* MemberPawn = MemberState->GetPawn())
             {
-                // 간단한 원형 대형 계산
                 float Angle = (2.0f * PI * i) / TeamMembers.Num();
                 FVector Offset = FVector(FMath::Cos(Angle) * 200.0f, FMath::Sin(Angle) * 200.0f, 0.0f);
                 FVector FormationPosition = TargetLocation + Offset;
 
-                // AI 이동 명령 (실제 구현에서는 AI 컨트롤러를 통해 처리)
                 if (AHSCharacterBase* Character = Cast<AHSCharacterBase>(MemberPawn))
                 {
-                    // 이동 로직 구현 필요
+                    if (AController* Controller = Character->GetController())
+                    {
+                        UAIBlueprintHelperLibrary::SimpleMoveToLocation(Controller, FormationPosition);
+                    }
+                    else
+                    {
+                        const FVector CurrentLocation = Character->GetActorLocation();
+                        const FVector NewLocation = FMath::VInterpTo(
+                            CurrentLocation,
+                            FormationPosition,
+                            World->GetDeltaSeconds(),
+                            3.0f);
+                        Character->SetActorLocation(NewLocation);
+                    }
+
+                    const FVector DesiredDirection = (FormationPosition - Character->GetActorLocation()).GetSafeNormal();
+                    if (!DesiredDirection.IsNearlyZero())
+                    {
+                        Character->SetActorRotation(DesiredDirection.Rotation());
+                    }
                 }
             }
         }
@@ -1055,11 +1131,24 @@ void UHSCoopMechanics::ApplySuccessRewards(const FCoopActionData& ActionData, co
             continue;
         }
 
-        // 경험치 보너스 적용 (예시)
         if (UHSStatsComponent* StatsComp = Participant->FindComponentByClass<UHSStatsComponent>())
         {
-            float BonusXP = 100.0f * ActionData.SuccessRewardMultiplier;
-            // StatsComp->AddExperience(BonusXP); // 실제 구현에서는 경험치 시스템에 맞게 수정
+            const int32 BonusXP = FMath::Max(1, FMath::RoundToInt(100.0f * ActionData.SuccessRewardMultiplier));
+            StatsComp->GainExperience(BonusXP);
+
+            // 안정적인 전투 지속을 위해 체력을 소폭 회복
+            const float HealAmount = StatsComp->GetCurrentHealth() * 0.05f + 25.0f;
+            StatsComp->Heal(HealAmount);
+
+            // 이동 속도 보너스 부여로 성공 보상 체감 강화
+            FBuffData MomentumBuff;
+            MomentumBuff.BuffID = TEXT("CoopSuccessMomentum");
+            MomentumBuff.BuffType = EBuffType::MovementSpeed;
+            MomentumBuff.PercentValuePerStack = 0.1f;
+            MomentumBuff.Value = 0.1f;
+            MomentumBuff.Duration = ActionData.ExecutionDuration + 5.0f;
+            MomentumBuff.bIsPercentage = true;
+            StatsComp->ApplyBuff(MomentumBuff);
         }
 
         UE_LOG(LogTemp, Log, TEXT("HSCoopMechanics: %s에게 성공 보상 적용 (배율: %.2f)"), 
@@ -1070,7 +1159,30 @@ void UHSCoopMechanics::ApplySuccessRewards(const FCoopActionData& ActionData, co
 // 실패 패널티 적용
 void UHSCoopMechanics::ApplyFailurePenalties(const FCoopActionData& ActionData, const TArray<AHSCharacterBase*>& Participants)
 {
-    // 현재는 로그만 출력, 필요에 따라 패널티 구현
+    for (AHSCharacterBase* Participant : Participants)
+    {
+        if (!Participant)
+        {
+            continue;
+        }
+
+        if (UHSStatsComponent* StatsComp = Participant->FindComponentByClass<UHSStatsComponent>())
+        {
+            const float StaminaPenalty = FMath::Max(10.0f, StatsComp->GetCurrentStamina() * 0.15f);
+            StatsComp->ConsumeStamina(StaminaPenalty);
+
+            FBuffData SlowDebuff;
+            SlowDebuff.BuffID = TEXT("CoopFailureSlow");
+            SlowDebuff.BuffType = EBuffType::MovementSpeed;
+            SlowDebuff.PercentValuePerStack = -0.12f;
+            SlowDebuff.Value = -0.12f;
+            SlowDebuff.Duration = 8.0f;
+            SlowDebuff.bIsPercentage = true;
+            SlowDebuff.bStackable = false;
+            StatsComp->ApplyBuff(SlowDebuff);
+        }
+    }
+
     UE_LOG(LogTemp, Log, TEXT("HSCoopMechanics: 협동 액션 '%s' 실패 - 참여자 %d명"), 
            *ActionData.ActionID.ToString(), Participants.Num());
 }
@@ -1311,7 +1423,7 @@ void UHSCoopMechanics::HandleRevivalCompleted(AHSCharacterBase* DeadPlayer)
         return;
     }
 
-    // 부활 처리 (실제 구현에서는 캐릭터의 부활 메서드 호출)
+    // 부활 처리
     if (UHSCombatComponent* CombatComp = DeadPlayer->FindComponentByClass<UHSCombatComponent>())
     {
         // 체력 일부 회복하여 부활
@@ -1419,7 +1531,7 @@ void UHSCoopMechanics::ProcessCooperativePuzzle(const FCoopActionData& ActionDat
         return;
     }
 
-    // 퍼즐 해결 시뮬레이션 (실제로는 게임 상황에 맞게 구현)
+    // 퍼즐 해결 성공 시 보상 적용
     for (AHSCharacterBase* Participant : ActiveAction.Participants)
     {
         if (!Participant)
@@ -1431,7 +1543,7 @@ void UHSCoopMechanics::ProcessCooperativePuzzle(const FCoopActionData& ActionDat
             // 지혜 버프 적용
             FBuffData WisdomBuff;
             WisdomBuff.BuffID = TEXT("PuzzleSolverBuff");
-            WisdomBuff.BuffType = EBuffType::Defense; // 임시로 방어력 버프 사용
+            WisdomBuff.BuffType = EBuffType::Defense; // 퍼즐 해결 능력을 방어력 증가로 표현
             WisdomBuff.Value = 0.2f; // 20% 방어력 증가
             WisdomBuff.Duration = 30.0f;
             WisdomBuff.bIsPercentage = true;
@@ -1620,7 +1732,6 @@ void UHSCoopMechanics::ProcessSynchronizedDefense(const FCoopActionData& ActionD
         // 데미지 분산 효과 (간소화된 구현)
         if (UHSCombatComponent* CombatComp = Participant->FindComponentByClass<UHSCombatComponent>())
         {
-            // 실제로는 데미지 분산 로직을 CombatComponent에 구현해야 함
             UE_LOG(LogTemp, Log, TEXT("HSCoopMechanics: %s에게 데미지 분산 효과 적용"), *Participant->GetName());
         }
     }

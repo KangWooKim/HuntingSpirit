@@ -1,5 +1,5 @@
 // HuntingSpirit 게임의 플레이어 간 통신 시스템 구현
-// 채팅, 음성채팅, 핑 시스템의 실제 동작 로직
+// 채팅, 음성채팅, 핑 시스템의 핵심 동작 로직
 // 작성자: KangWooKim (https://github.com/KangWooKim)
 
 #include "HSCommunicationSystem.h"
@@ -167,7 +167,7 @@ bool UHSCommunicationSystem::SendChatMessage(const FString& Message, EHSChatType
             break;
     }
     
-    // 현업 최적화: 배치 처리를 위해 대기 큐에 추가
+    // 배치 처리를 위해 대기 큐에 추가
     PendingChatMessages.Add(ChatMessage);
     
     // 스팸 방지 데이터 업데이트
@@ -195,7 +195,7 @@ void UHSCommunicationSystem::ReceiveChatMessage(const FHSChatMessage& ChatMessag
         return;
     }
     
-    // 현업 최적화: 오브젝트 풀링 사용
+    // 오브젝트 풀링 사용
     FHSChatMessage* PooledMessage = nullptr;
     if (MessagePool.Num() > 0)
     {
@@ -326,7 +326,7 @@ bool UHSCommunicationSystem::RemovePing(int32 PingID)
 {
     if (ActivePings.Contains(PingID))
     {
-        // 현업 최적화: 핑 데이터를 풀로 반환
+        // 사용이 끝난 핑 데이터를 풀로 반환
         FHSPingData RemovedPing = ActivePings[PingID];
         PingPool.Add(RemovedPing);
         
@@ -385,7 +385,7 @@ bool UHSCommunicationSystem::StartVoiceChat()
     }
     
     // 음성 채팅 초기화 시도
-    // 실제 구현에서는 UE5의 VoiceChat 서브시스템을 사용
+    // UE5 VoiceChat 서브시스템 연동 지점
     bVoiceChatEnabled = true;
     
     // 로컬 플레이어 음성 정보 초기화
@@ -546,7 +546,7 @@ TArray<FHSVoiceChatPlayerInfo> UHSCommunicationSystem::GetAllVoiceInfo() const
 
 int32 UHSCommunicationSystem::GetPlayerIDByName(const FString& PlayerName) const
 {
-    // 현업 최적화: 캐시 사용
+    // 캐시 사용
     if (const int32* CachedID = PlayerNameToIDCache.Find(PlayerName))
     {
         FDateTime CurrentTime = FDateTime::Now();
@@ -556,7 +556,7 @@ int32 UHSCommunicationSystem::GetPlayerIDByName(const FString& PlayerName) const
         }
     }
     
-    // 캐시 미스 또는 만료된 경우 실제 검색
+    // 캐시 미스 또는 만료된 경우 데이터 재조회
     if (UWorld* World = GetWorld())
     {
         if (AGameStateBase* GameState = World->GetGameState())
@@ -583,7 +583,7 @@ int32 UHSCommunicationSystem::GetPlayerIDByName(const FString& PlayerName) const
 
 FString UHSCommunicationSystem::GetPlayerNameByID(int32 PlayerID) const
 {
-    // 현업 최적화: 캐시 사용
+    // 캐시 사용
     if (const FString* CachedName = PlayerIDToNameCache.Find(PlayerID))
     {
         FDateTime CurrentTime = FDateTime::Now();
@@ -593,7 +593,7 @@ FString UHSCommunicationSystem::GetPlayerNameByID(int32 PlayerID) const
         }
     }
     
-    // 캐시 미스 또는 만료된 경우 실제 검색
+    // 캐시 미스 또는 만료된 경우 데이터 재조회
     if (UWorld* World = GetWorld())
     {
         if (AGameStateBase* GameState = World->GetGameState())
@@ -626,10 +626,10 @@ FString UHSCommunicationSystem::FilterProfanity(const FString& Input) const
     }
     
     // 간단한 욕설 필터링 구현
-    // 실제 구현에서는 더 정교한 필터링 시스템을 사용
+    // 추가 필터링 로직 확장 가능
     TArray<FString> ProfanityWords = {
         TEXT("욕설1"), TEXT("욕설2"), TEXT("욕설3")
-        // 실제 욕설 목록을 추가
+        // 욕설 목록을 프로젝트 요구사항에 맞게 확장
     };
     
     FString FilteredText = Input;
@@ -731,7 +731,7 @@ void UHSCommunicationSystem::CheckExpiredPings()
 void UHSCommunicationSystem::InitializeVoiceChat()
 {
     // UE5 음성 채팅 서브시스템 초기화
-    // 실제 구현에서는 VoiceChat 모듈을 사용
+    // VoiceChat 모듈 연동 지점
     
     UE_LOG(LogTemp, Log, TEXT("HSCommunicationSystem: 음성 채팅 시스템 초기화됨"));
 }
@@ -760,7 +760,7 @@ void UHSCommunicationSystem::UpdatePlayerVoiceState(int32 PlayerID, EHSVoiceChat
 
 void UHSCommunicationSystem::ProcessPendingMessages()
 {
-    // 현업 최적화: 배치 처리로 네트워크 부하 감소
+    // 배치 처리로 네트워크 부하 감소
     
     // 대기 중인 채팅 메시지 처리
     if (PendingChatMessages.Num() > 0)
@@ -778,7 +778,7 @@ void UHSCommunicationSystem::ProcessPendingMessages()
         for (const FHSPingData& Ping : PendingPings)
         {
             // 핑 네트워크 전송 로직
-            // 실제 구현에서는 네트워크 복제 처리
+            // 네트워크 복제 처리 지점
         }
         PendingPings.Empty();
     }

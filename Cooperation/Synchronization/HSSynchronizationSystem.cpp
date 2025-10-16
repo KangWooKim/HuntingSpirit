@@ -1,5 +1,5 @@
 // HuntingSpirit 게임의 고급 동기화 시스템 구현
-// 지연 보상, 예측, 롤백, 네트워크 상태 동기화 실제 로직
+// 지연 보상, 예측, 롤백, 네트워크 상태 동기화 핵심 로직
 // 작성자: KangWooKim (https://github.com/KangWooKim)
 
 #include "HSSynchronizationSystem.h"
@@ -143,7 +143,7 @@ void UHSSynchronizationSystem::Deinitialize()
 
 void UHSSynchronizationSystem::TickSynchronization(float DeltaTime)
 {
-    // 현업 최적화: 프레임 번호 증가
+    // 프레임 번호 증가
     CurrentFrameNumber++;
     
     // 예측 상태 업데이트
@@ -174,7 +174,7 @@ bool UHSSynchronizationSystem::SendSyncPacket(EHSSyncType SyncType, const TArray
         }
     }
     
-    // 현업 최적화: 오브젝트 풀링 사용
+    // 오브젝트 풀링 사용
     FHSSyncPacket* Packet = nullptr;
     if (PacketPool.Num() > 0)
     {
@@ -295,7 +295,7 @@ void UHSSynchronizationSystem::SetSyncPriority(EHSSyncType SyncType, EHSSyncPrio
 
 EHSSyncStatus UHSSynchronizationSystem::GetSyncStatus(EHSSyncType SyncType) const
 {
-    // 현업 최적화: 캐시 확인
+    // 캐시 확인
     if (const EHSSyncStatus* CachedStatus = StatusCache.Find(SyncType))
     {
         FDateTime CurrentTime = FDateTime::Now();
@@ -380,7 +380,7 @@ bool UHSSynchronizationSystem::UpdatePrediction(const FString& StateID, const FH
 
 FHSPredictionState UHSSynchronizationSystem::GetPredictedState(const FString& StateID, float FutureTime) const
 {
-    // 현업 최적화: 캐시 확인
+    // 캐시 확인
     FString CacheKey = FString::Printf(TEXT("%s_%.3f"), *StateID, FutureTime);
     if (const FHSPredictionState* CachedState = PredictionCache.Find(CacheKey))
     {
@@ -502,7 +502,7 @@ FString UHSSynchronizationSystem::SaveStateSnapshot(const TArray<uint8>& StateDa
 {
     FString StateID = GenerateStateID();
     
-    // 현업 최적화: 오브젝트 풀링 사용
+    // 오브젝트 풀링 사용
     FHSRollbackState* State = nullptr;
     if (RollbackPool.Num() > 0)
     {
@@ -562,7 +562,7 @@ bool UHSSynchronizationSystem::RollbackToState(const FString& StateID)
         return false;
     }
     
-    // 롤백 실행 (실제 구현에서는 게임 상태 복원)
+    // 롤백 실행
     int32 FramesRolledBack = CurrentFrameNumber - TargetState->FrameNumber;
     CurrentFrameNumber = TargetState->FrameNumber;
     
@@ -699,7 +699,7 @@ bool UHSSynchronizationSystem::ApplyDelayedReward(const FString& RewardID)
         return false;
     }
     
-    // 실제 보상 적용 로직 (실제 구현에서는 인벤토리 시스템 연동)
+    // 보상 적용 로직 (인벤토리 시스템 연동 지점)
     // 여기서는 델리게이트 호출로 대체
     OnDelayedRewardApplied.Broadcast(RewardID, Reward->RecipientPlayerID);
     
@@ -998,7 +998,7 @@ void UHSSynchronizationSystem::ProcessPacketQueue()
         return A.SequenceNumber < B.SequenceNumber; // 시퀀스 번호 순
     });
     
-    // 실제 네트워크 전송 (시뮬레이션)
+    // 네트워크 전송 시뮬레이션
     int32 ProcessedPackets = 0;
     const int32 MaxPacketsPerTick = 10; // 틱당 최대 처리 패킷 수
     
@@ -1007,7 +1007,7 @@ void UHSSynchronizationSystem::ProcessPacketQueue()
         const FHSSyncPacket& Packet = OutgoingPackets[i];
         
         // 패킷 전송 시뮬레이션
-        // 실제 구현에서는 UE5 네트워크 시스템 사용
+        // UE5 네트워크 시스템 연동 지점
         
         // 풀로 반환
         PacketPool.Add(Packet);

@@ -112,8 +112,6 @@ void AHSMagicProjectile::OnActivated_Implementation()
     
     // 수명 초기화
     CurrentLifeTime = 0.0f;
-    
-    UE_LOG(LogTemp, Log, TEXT("HSMagicProjectile: Activated"));
 }
 
 // 오브젝트 풀에서 비활성화될 때 호출
@@ -140,8 +138,6 @@ void AHSMagicProjectile::OnDeactivated_Implementation()
     // 위치 초기화
     SetActorLocation(FVector::ZeroVector);
     SetActorRotation(FRotator::ZeroRotator);
-    
-    UE_LOG(LogTemp, Log, TEXT("HSMagicProjectile: Deactivated"));
 }
 
 // 오브젝트 풀에서 생성될 때 호출
@@ -149,8 +145,6 @@ void AHSMagicProjectile::OnCreated_Implementation()
 {
     // 생성 시 초기화 작업
     CurrentLifeTime = 0.0f;
-    
-    UE_LOG(LogTemp, Log, TEXT("HSMagicProjectile: Created in pool"));
 }
 
 // 발사체 초기화
@@ -190,8 +184,6 @@ void AHSMagicProjectile::InitializeProjectile(FVector Direction, float Speed, fl
     // 수명 초기화
     CurrentLifeTime = 0.0f;
     
-    UE_LOG(LogTemp, Log, TEXT("HSMagicProjectile: Initialized - Direction: %s, Speed: %f, Damage: %f"), 
-           *NormalizedDirection.ToString(), Speed, ProjectileDamage);
 }
 
 // 충돌 시 호출
@@ -202,8 +194,6 @@ void AHSMagicProjectile::OnHit(UPrimitiveComponent* HitComponent, AActor* OtherA
     {
         return;
     }
-
-    UE_LOG(LogTemp, Log, TEXT("HSMagicProjectile: Hit actor %s"), OtherActor ? *OtherActor->GetName() : TEXT("Unknown"));
 
     // 적에게 데미지 적용
     UHSCombatComponent* TargetCombat = OtherActor->FindComponentByClass<UHSCombatComponent>();
@@ -220,8 +210,6 @@ void AHSMagicProjectile::OnHit(UPrimitiveComponent* HitComponent, AActor* OtherA
         // 데미지 적용
         FHSDamageResult DamageResult = TargetCombat->ApplyDamage(DamageInfo, GetOwner());
         
-        UE_LOG(LogTemp, Log, TEXT("HSMagicProjectile: Applied %f damage to %s"), 
-               DamageResult.FinalDamage, *OtherActor->GetName());
     }
 
     // 충돌 이펙트 생성 (향후 파티클 시스템 추가 가능)
