@@ -1,11 +1,49 @@
 #include "HSRunManager.h"
 #include "Engine/World.h"
 #include "Engine/GameInstance.h"
+#include "Engine/LocalPlayer.h"
 #include "TimerManager.h"
+#include "Containers/Set.h"
+#include "GameFramework/GameStateBase.h"
+#include "GameFramework/PlayerState.h"
 #include "Kismet/GameplayStatics.h"
+#include "OnlineSubsystemTypes.h"
 #include "HAL/PlatformFilemanager.h"
 #include "Misc/DateTime.h"
 #include "Math/UnrealMathUtility.h"
+
+namespace
+{
+    FString BuildPlayerIdentifier(const APlayerState* PlayerState)
+    {
+        if (!PlayerState)
+        {
+            return FString();
+        }
+
+        if (PlayerState->GetUniqueId().IsValid())
+        {
+            return PlayerState->GetUniqueId()->ToString();
+        }
+
+        return PlayerState->GetPlayerName();
+    }
+
+    FString BuildLocalPlayerIdentifier(const ULocalPlayer* LocalPlayer)
+    {
+        if (!LocalPlayer)
+        {
+            return FString();
+        }
+
+        if (const TSharedPtr<const FUniqueNetId>& NetId = LocalPlayer->GetPreferredUniqueNetId())
+        {
+            return NetId->ToString();
+        }
+
+        return LocalPlayer->GetNickname();
+    }
+}
 
 UHSRunManager::UHSRunManager()
 {
@@ -466,9 +504,67 @@ void UHSRunManager::UpdateRunProgress()
             return;
         }
     }
-    
-    // 플레이어 연결 상태 확인 (멀티플레이어에서)
-    // TODO: 네트워킹 시스템과 연동하여 플레이어 연결 상태 확인
+
+    if (CurrentRun.ParticipantIDs.Num() > 0)
+    {
+        TSet<FString> ConnectedPlayerIds;
+
+        if (UWorld* World = GetWorld())
+        {
+            if (AGameStateBase* GameState = World->GetGameState())
+            {
+                for (APlayerState* PlayerState : GameState->PlayerArray)
+                {
+                    const FString Identifier = BuildPlayerIdentifier(PlayerState);
+                    if (!Identifier.IsEmpty())
+                    {
+                        ConnectedPlayerIds.Add(Identifier);
+                    }
+                }
+            }
+        }
+
+        if (ConnectedPlayerIds.Num() == 0)
+        {
+            if (UGameInstance* GameInstance = GetGameInstance())
+            {
+                for (ULocalPlayer* LocalPlayer : GameInstance->GetLocalPlayers())
+                {
+                    const FString Identifier = BuildLocalPlayerIdentifier(LocalPlayer);
+                    if (!Identifier.IsEmpty())
+                    {
+                        ConnectedPlayerIds.Add(Identifier);
+                    }
+                }
+            }
+        }
+
+        if (ConnectedPlayerIds.Num() > 0)
+        {
+            for (const FString& Identifier : ConnectedPlayerIds)
+            {
+                if (!CurrentRun.ParticipantIDs.Contains(Identifier))
+                {
+                    CurrentRun.ParticipantIDs.Add(Identifier);
+                }
+            }
+
+            for (const FString& ParticipantId : CurrentRun.ParticipantIDs)
+            {
+                if (ParticipantId.Equals(TEXT("LocalPlayer")))
+                {
+                    continue;
+                }
+
+                if (!ConnectedPlayerIds.Contains(ParticipantId))
+                {
+                    UE_LOG(LogTemp, Warning, TEXT("런 참가자 연결 끊김 감지: %s"), *ParticipantId);
+                    EndCurrentRun(EHSRunResult::Disconnection);
+                    return;
+                }
+            }
+        }
+    }
 }
 
 void UHSRunManager::UpdateStatistics()
@@ -495,10 +591,46 @@ void UHSRunManager::InitializeRunData(const FHSRunConfiguration& Configuration)
     CurrentRun.EndTime = FDateTime::MinValue();
     CurrentRun.ElapsedTime = 0.0f;
     
-    // 참가자 ID 초기화 (현재는 로컬 플레이어만)
-    // TODO: 멀티플레이어 시 실제 플레이어 ID들로 채우기
     CurrentRun.ParticipantIDs.Empty();
-    CurrentRun.ParticipantIDs.Add(TEXT("LocalPlayer"));
+
+    TSet<FString> UniqueParticipants;
+
+    if (UWorld* World = GetWorld())
+    {
+        if (AGameStateBase* GameState = World->GetGameState())
+        {
+            for (APlayerState* PlayerState : GameState->PlayerArray)
+            {
+                const FString Identifier = BuildPlayerIdentifier(PlayerState);
+                if (!Identifier.IsEmpty())
+                {
+                    UniqueParticipants.Add(Identifier);
+                }
+            }
+        }
+    }
+
+    if (UGameInstance* GameInstance = GetGameInstance())
+    {
+        for (ULocalPlayer* LocalPlayer : GameInstance->GetLocalPlayers())
+        {
+            const FString Identifier = BuildLocalPlayerIdentifier(LocalPlayer);
+            if (!Identifier.IsEmpty())
+            {
+                UniqueParticipants.Add(Identifier);
+            }
+        }
+    }
+
+    for (const FString& ParticipantId : UniqueParticipants)
+    {
+        CurrentRun.ParticipantIDs.Add(ParticipantId);
+    }
+
+    if (CurrentRun.ParticipantIDs.Num() == 0)
+    {
+        CurrentRun.ParticipantIDs.Add(TEXT("LocalPlayer"));
+    }
     
     // 캐시 초기화
     CachedDifficultyMultiplier = 1.0f;

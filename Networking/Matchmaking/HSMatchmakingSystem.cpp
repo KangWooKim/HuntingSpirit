@@ -46,7 +46,7 @@ void UHSMatchmakingSystem::Initialize(FSubsystemCollectionBase& Collection)
         }
     }
     
-    // 오브젝트 풀 초기화 (현업 최적화)
+    // 매치메이킹용 오브젝트 풀 사전 예약
     PlayerPool.Reserve(100);
     MatchPool.Reserve(50);
     

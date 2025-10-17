@@ -306,6 +306,13 @@ protected:
     UPROPERTY(meta = (BindWidget))
     TObjectPtr<UTextBlock> Text_SuccessRate;
 
+    // === 위젯 바인딩 - 오류 표시 (선택적) ===
+    UPROPERTY(meta = (BindWidgetOptional))
+    TObjectPtr<UCanvasPanel> Panel_ErrorDialog;
+
+    UPROPERTY(meta = (BindWidgetOptional))
+    TObjectPtr<UTextBlock> Text_ErrorMessage;
+
     // === 내부 상태 ===
     UPROPERTY()
     EHSMenuState CurrentMenuState;
@@ -462,4 +469,12 @@ private:
     
     static constexpr float MatchAcceptanceTimeoutSeconds = 30.0f;
     static constexpr float UIUpdateIntervalSeconds = 0.1f;
+    static constexpr float ErrorMessageDisplaySeconds = 4.0f;
+
+    void HideErrorDialog();
+    FHSMatchmakingRequest BuildMatchmakingRequest(EHSMatchType MatchType, int32 DefaultMaxPing, bool bAllowCrossPlatform) const;
+    float CalculatePlayerSkillRating() const;
+    EHSRegion ResolvePreferredRegion() const;
+
+    mutable FTimerHandle ErrorDialogTimerHandle;
 };

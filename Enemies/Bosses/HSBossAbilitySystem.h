@@ -1,7 +1,6 @@
 // HSBossAbilitySystem.h
 // HuntingSpirit Game - 보스 능력 시스템
 // 보스 몬스터의 특수 능력을 관리하고 실행하는 시스템
-// 현업 수준의 최적화 기법 적용: 메모리 풀링, 캐싱, SIMD, 배치 처리 등
 
 #pragma once
 
@@ -77,7 +76,7 @@ enum class EHSAbilityEffectType : uint8
     Special     UMETA(DisplayName = "Special")
 };
 
-// 보스 능력 데이터 구조체 - 현업 수준 최적화
+// 보스 능력 데이터 구조체
 USTRUCT(BlueprintType)
 struct HUNTINGSPIRIT_API FHSBossAbility
 {

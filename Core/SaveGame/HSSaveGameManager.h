@@ -67,6 +67,9 @@ struct FHSSaveSlotInfo
     UPROPERTY(BlueprintReadWrite, Category = "Save Slot")
     int32 SaveDataVersion = 1;
 
+    UPROPERTY(BlueprintReadWrite, Category = "Save Slot")
+    uint32 Checksum = 0;
+
     FHSSaveSlotInfo()
     {
         SlotIndex = 0;
@@ -77,6 +80,7 @@ struct FHSSaveSlotInfo
         bIsAutosave = false;
         FileSizeMB = 0.0f;
         SaveDataVersion = 1;
+        Checksum = 0;
     }
 };
 
@@ -190,7 +194,6 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnCloudSyncStatusChanged, const FHS
 
 /**
  * 저장/로드 시스템 관리자 - 비동기 저장/로드, 자동 저장, 백업 시스템
- * 현업 최적화: 압축, 암호화, 클라우드 동기화, 무결성 검증
  */
 UCLASS(BlueprintType, Blueprintable)
 class HUNTINGSPIRIT_API UHSSaveGameManager : public UGameInstanceSubsystem
@@ -390,7 +393,7 @@ protected:
     
     // 파일 I/O
     bool WriteToFile(const FString& FilePath, const TArray<uint8>& Data);
-    bool ReadFromFile(const FString& FilePath, TArray<uint8>& OutData);
+    bool ReadFromFile(const FString& FilePath, TArray<uint8>& OutData) const;
     
     // 압축 및 암호화
     TArray<uint8> CompressData(const TArray<uint8>& Data) const;

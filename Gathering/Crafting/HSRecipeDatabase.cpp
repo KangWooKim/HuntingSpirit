@@ -2,6 +2,8 @@
 #include "../../Items/HSItemBase.h"
 #include "Engine/DataTable.h"
 #include "Engine/World.h"
+#include "Engine/AssetManager.h"
+#include "Engine/StreamableManager.h"
 #include "Misc/FileHelper.h"
 #include "Misc/DateTime.h"
 #include "Dom/JsonObject.h"
@@ -752,9 +754,36 @@ bool UHSRecipeDatabase::ValidateGroup(const FHSRecipeGroup& Group, FString& OutE
 
 void UHSRecipeDatabase::AsyncLoadRecipeData()
 {
-    // 비동기 로딩은 향후 구현
-    // 현재는 동기식 로딩 사용
-    LoadAllData();
+    if (bDataLoaded)
+    {
+        return;
+    }
+
+    if (RecipeDataTable.IsNull())
+    {
+        LoadAllData();
+        return;
+    }
+
+    const FSoftObjectPath DataTablePath = RecipeDataTable.ToSoftObjectPath();
+    if (!DataTablePath.IsValid())
+    {
+        LoadAllData();
+        return;
+    }
+
+    FStreamableManager& Streamable = UAssetManager::GetStreamableManager();
+    TWeakObjectPtr<UHSRecipeDatabase> WeakThis(this);
+
+    Streamable.RequestAsyncLoad(DataTablePath, FStreamableDelegate::CreateLambda([WeakThis]()
+    {
+        if (!WeakThis.IsValid())
+        {
+            return;
+        }
+
+        WeakThis->LoadAllData();
+    }));
 }
 
 void UHSRecipeDatabase::CacheFrequentlyAccessedData()

@@ -1384,13 +1384,68 @@ bool UHSDedicatedServerManager::ValidateServerState(bool bRequireNetworkReady) c
 #if PLATFORM_WINDOWS
 void UHSDedicatedServerManager::InitializeWindowsSpecific()
 {
-    UE_LOG(LogTemp, Log, TEXT("HSDedicatedServerManager: Windows 전용 초기화"));
-    // Windows 전용 서버 설정
+    UE_LOG(LogTemp, Log, TEXT("HSDedicatedServerManager: Windows 전용 초기화 시작"));
+
+    if (!ServerConfig || !ServerSocket.IsValid())
+    {
+        UE_LOG(LogTemp, Warning, TEXT("HSDedicatedServerManager: Windows 초기화 건너뜀 - 서버 리소스가 준비되지 않았습니다"));
+        return;
+    }
+
+    const FHSNetworkConfig& NetConfig = ServerConfig->GetNetworkConfig();
+
+    int32 AppliedSendSize = 0;
+    const int32 DesiredSendSize = FMath::Max(NetConfig.SendBufferSize, 65536);
+    if (!ServerSocket->SetSendBufferSize(DesiredSendSize, AppliedSendSize))
+    {
+        UE_LOG(LogTemp, Warning, TEXT("HSDedicatedServerManager: 송신 버퍼 크기 설정 실패 (요청: %d)"), DesiredSendSize);
+    }
+
+    int32 AppliedReceiveSize = 0;
+    const int32 DesiredReceiveSize = FMath::Max(NetConfig.ReceiveBufferSize, 65536);
+    if (!ServerSocket->SetReceiveBufferSize(DesiredReceiveSize, AppliedReceiveSize))
+    {
+        UE_LOG(LogTemp, Warning, TEXT("HSDedicatedServerManager: 수신 버퍼 크기 설정 실패 (요청: %d)"), DesiredReceiveSize);
+    }
+
+    ServerSocket->SetNoDelay(true);
+    ServerSocket->SetLinger(false, 0);
+
+    UE_LOG(LogTemp, Log, TEXT("HSDedicatedServerManager: Windows 전용 네트워크 튜닝 완료 (Send %d/%d, Receive %d/%d)"),
+           DesiredSendSize, AppliedSendSize, DesiredReceiveSize, AppliedReceiveSize);
 }
 #elif PLATFORM_LINUX
 void UHSDedicatedServerManager::InitializeLinuxSpecific()
 {
-    UE_LOG(LogTemp, Log, TEXT("HSDedicatedServerManager: Linux 전용 초기화"));
-    // Linux 전용 서버 설정
+    UE_LOG(LogTemp, Log, TEXT("HSDedicatedServerManager: Linux 전용 초기화 시작"));
+
+    if (!ServerConfig || !ServerSocket.IsValid())
+    {
+        UE_LOG(LogTemp, Warning, TEXT("HSDedicatedServerManager: Linux 초기화 건너뜀 - 서버 리소스가 준비되지 않았습니다"));
+        return;
+    }
+
+    const FHSNetworkConfig& NetConfig = ServerConfig->GetNetworkConfig();
+
+    ServerSocket->SetReusePort(true);
+
+    int32 AppliedSendSize = 0;
+    const int32 DesiredSendSize = FMath::Max(NetConfig.SendBufferSize * 2, NetConfig.SendBufferSize);
+    if (!ServerSocket->SetSendBufferSize(DesiredSendSize, AppliedSendSize))
+    {
+        UE_LOG(LogTemp, Warning, TEXT("HSDedicatedServerManager: (Linux) 송신 버퍼 크기 설정 실패 (요청: %d)"), DesiredSendSize);
+    }
+
+    int32 AppliedReceiveSize = 0;
+    const int32 DesiredReceiveSize = FMath::Max(NetConfig.ReceiveBufferSize * 2, NetConfig.ReceiveBufferSize);
+    if (!ServerSocket->SetReceiveBufferSize(DesiredReceiveSize, AppliedReceiveSize))
+    {
+        UE_LOG(LogTemp, Warning, TEXT("HSDedicatedServerManager: (Linux) 수신 버퍼 크기 설정 실패 (요청: %d)"), DesiredReceiveSize);
+    }
+
+    ServerSocket->SetLinger(true, 1);
+
+    UE_LOG(LogTemp, Log, TEXT("HSDedicatedServerManager: Linux 전용 네트워크 튜닝 완료 (Send %d/%d, Receive %d/%d)"),
+           DesiredSendSize, AppliedSendSize, DesiredReceiveSize, AppliedReceiveSize);
 }
 #endif

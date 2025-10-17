@@ -1,6 +1,5 @@
 // HSBossAbilitySystem.cpp
 // HuntingSpirit Game - 보스 능력 시스템 구현
-// 현업 수준의 최적화 기법 적용: SIMD, 메모리 풀링, 캐싱, 배치 처리
 
 #include "HSBossAbilitySystem.h"
 #include "HSBossBase.h"
@@ -12,6 +11,8 @@
 #include "Kismet/KismetMathLibrary.h"
 #include "Kismet/KismetSystemLibrary.h"
 #include "Components/SphereComponent.h"
+#include "Components/SceneComponent.h"
+#include "UObject/UObjectGlobals.h"
 #include "NiagaraComponent.h"
 #include "NiagaraSystem.h"
 #include "Components/AudioComponent.h"
@@ -197,7 +198,7 @@ void UHSBossAbilitySystem::EndPlay(const EEndPlayReason::Type EndPlayReason)
     InterruptAllAbilities();
     
     // 타이머 정리
-    if (UWorld* World = GetWorld())
+    if (GetWorld())
     {
         FTimerManager& TimerManager = World->GetTimerManager();
         for (auto& Timer : CooldownTimers)
@@ -291,7 +292,7 @@ bool UHSBossAbilitySystem::RemoveAbility(FName AbilityID)
     }
     
     // 타이머 정리
-    if (UWorld* World = GetWorld())
+    if (GetWorld())
     {
         FTimerManager& TimerManager = World->GetTimerManager();
         
@@ -327,7 +328,7 @@ void UHSBossAbilitySystem::ClearAllAbilities()
     InterruptAllAbilities();
     
     // 모든 타이머 정리
-    if (UWorld* World = GetWorld())
+    if (GetWorld())
     {
         FTimerManager& TimerManager = World->GetTimerManager();
         
@@ -733,29 +734,39 @@ void UHSBossAbilitySystem::InitializeAbilitySystem()
     LoadDefaultAbilities();
     
     // VFX 및 Audio 풀 초기화
-    if (UWorld* World = GetWorld())
+    VFXPool.Reset();
+    AudioPool.Reset();
+
+    if (GetWorld())
     {
+        USceneComponent* BossRoot = OwnerBoss->GetRootComponent();
         for (int32 i = 0; i < 8; ++i)
         {
-            // VFX 컴포넌트 풀 생성
-            UNiagaraComponent* VFXComp = CreateDefaultSubobject<UNiagaraComponent>(
-                *FString::Printf(TEXT("PooledVFX_%d"), i));
+            const FName VFXComponentName = *FString::Printf(TEXT("PooledVFX_%d"), i);
+            UNiagaraComponent* VFXComp = NewObject<UNiagaraComponent>(OwnerBoss, VFXComponentName);
             if (VFXComp)
             {
                 VFXComp->SetAutoActivate(false);
-                VFXComp->AttachToComponent(OwnerBoss->GetRootComponent(), 
-                    FAttachmentTransformRules::KeepWorldTransform);
+                if (BossRoot)
+                {
+                    VFXComp->SetupAttachment(BossRoot);
+                }
+                OwnerBoss->AddOwnedComponent(VFXComp);
+                VFXComp->RegisterComponent();
                 VFXPool.Add(VFXComp);
             }
-            
-            // Audio 컴포넌트 풀 생성
-            UAudioComponent* AudioComp = CreateDefaultSubobject<UAudioComponent>(
-                *FString::Printf(TEXT("PooledAudio_%d"), i));
+
+            const FName AudioComponentName = *FString::Printf(TEXT("PooledAudio_%d"), i);
+            UAudioComponent* AudioComp = NewObject<UAudioComponent>(OwnerBoss, AudioComponentName);
             if (AudioComp)
             {
                 AudioComp->SetAutoActivate(false);
-                AudioComp->AttachToComponent(OwnerBoss->GetRootComponent(),
-                    FAttachmentTransformRules::KeepWorldTransform);
+                if (BossRoot)
+                {
+                    AudioComp->SetupAttachment(BossRoot);
+                }
+                OwnerBoss->AddOwnedComponent(AudioComp);
+                AudioComp->RegisterComponent();
                 AudioPool.Add(AudioComp);
             }
         }
@@ -2049,7 +2060,7 @@ FVector UHSBossAbilitySystem::GetOptimalTargetLocation(const FHSBossAbility& Abi
     return OptimalLocation;
 }
 
-// 디버그 정보 그리기 - 현업 수준 디버깅 도구
+// 디버그 정보 그리기
 void UHSBossAbilitySystem::DrawDebugInformation()
 {
     if (!bDebugMode || !IsValid(OwnerBoss))

@@ -107,7 +107,7 @@ struct HUNTINGSPIRIT_API FHSMaterialTemplate
 /**
  * 레시피 데이터베이스
  * 게임의 모든 제작 레시피와 관련 데이터를 관리하는 데이터 에셋
- * 현업 최적화: 지연 로딩, 캐싱, 메모리 효율적 데이터 구조
+ * 지연 로딩과 캐싱을 활용해 메모리를 효율적으로 사용합니다
  */
 UCLASS(BlueprintType, Blueprintable)
 class HUNTINGSPIRIT_API UHSRecipeDatabase : public UPrimaryDataAsset

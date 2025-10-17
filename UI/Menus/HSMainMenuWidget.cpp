@@ -12,6 +12,46 @@
 #include "Kismet/GameplayStatics.h"
 #include "Kismet/KismetSystemLibrary.h"
 
+namespace
+{
+EHSRegion ParseRegionIdentifier(const FString& RegionString)
+{
+    if (RegionString.IsEmpty())
+    {
+        return EHSRegion::Auto;
+    }
+
+    const FString Normalized = RegionString.ToLower();
+
+    if (Normalized.Contains(TEXT("north")) || Normalized.Equals(TEXT("na")) || Normalized.Equals(TEXT("us")) || Normalized.Contains(TEXT("america")))
+    {
+        return Normalized.Contains(TEXT("south")) ? EHSRegion::SouthAmerica : EHSRegion::NorthAmerica;
+    }
+
+    if (Normalized.Contains(TEXT("south")))
+    {
+        return EHSRegion::SouthAmerica;
+    }
+
+    if (Normalized.Contains(TEXT("europe")) || Normalized.Equals(TEXT("eu")))
+    {
+        return EHSRegion::Europe;
+    }
+
+    if (Normalized.Contains(TEXT("asia")) || Normalized.Equals(TEXT("kr")) || Normalized.Equals(TEXT("jp")))
+    {
+        return EHSRegion::Asia;
+    }
+
+    if (Normalized.Contains(TEXT("oceania")) || Normalized.Equals(TEXT("au")) || Normalized.Equals(TEXT("nz")))
+    {
+        return EHSRegion::Oceania;
+    }
+
+    return EHSRegion::Auto;
+}
+}
+
 UHSMainMenuWidget::UHSMainMenuWidget(const FObjectInitializer& ObjectInitializer)
     : Super(ObjectInitializer)
 {
@@ -41,6 +81,7 @@ void UHSMainMenuWidget::NativeConstruct()
     
     // 기본 메뉴 상태 설정
     SetMenuState(EHSMenuState::MainMenu);
+    HideErrorDialog();
     
     // UI 업데이트 타이머 시작
     if (GetWorld())
@@ -67,7 +108,9 @@ void UHSMainMenuWidget::NativeDestruct()
     {
         GetWorld()->GetTimerManager().ClearTimer(UIUpdateTimerHandle);
         GetWorld()->GetTimerManager().ClearTimer(MatchAcceptanceTimerHandle);
+        GetWorld()->GetTimerManager().ClearTimer(ErrorDialogTimerHandle);
     }
+    HideErrorDialog();
     
     // 매치메이킹 시스템 델리게이트 해제
     if (MatchmakingSystem)
@@ -165,12 +208,11 @@ void UHSMainMenuWidget::StartQuickMatch()
         return;
     }
     
-    FHSMatchmakingRequest Request;
-    Request.MatchType = EHSMatchType::QuickMatch;
-    Request.PreferredRegion = EHSRegion::Auto;
-    Request.MaxPing = 100;
-    Request.SkillRating = 1000.0f; // 실제로는 플레이어 레이팅 사용
-    Request.bAllowCrossPlatform = true;
+    const FHSMatchmakingRequest Request = BuildMatchmakingRequest(
+        EHSMatchType::QuickMatch,
+        100,
+        true
+    );
     
     if (MatchmakingSystem->StartMatchmaking(Request))
     {
@@ -191,12 +233,11 @@ void UHSMainMenuWidget::StartRankedMatch()
         return;
     }
     
-    FHSMatchmakingRequest Request;
-    Request.MatchType = EHSMatchType::RankedMatch;
-    Request.PreferredRegion = EHSRegion::Auto;
-    Request.MaxPing = 80; // 랭크 매치는 더 엄격한 핑 요구사항
-    Request.SkillRating = 1000.0f;
-    Request.bAllowCrossPlatform = false; // 랭크 매치는 크로스플랫폼 비활성화
+    const FHSMatchmakingRequest Request = BuildMatchmakingRequest(
+        EHSMatchType::RankedMatch,
+        80,
+        false
+    );
     
     if (MatchmakingSystem->StartMatchmaking(Request))
     {
@@ -211,8 +252,28 @@ void UHSMainMenuWidget::StartRankedMatch()
 
 void UHSMainMenuWidget::StartCustomMatch()
 {
-    // 커스텀 매치 로직 구현 예정
-    ShowErrorDialog(TEXT("커스텀 매치는 아직 구현되지 않았습니다."));
+    if (!MatchmakingSystem)
+    {
+        ShowErrorDialog(TEXT("매치메이킹 시스템을 사용할 수 없습니다."));
+        return;
+    }
+
+    const int32 DefaultCustomMaxPing = CurrentSaveData ? CurrentSaveData->NetworkSettings.MaxPingThreshold : 120;
+    const FHSMatchmakingRequest Request = BuildMatchmakingRequest(
+        EHSMatchType::CustomMatch,
+        DefaultCustomMaxPing > 0 ? DefaultCustomMaxPing : 120,
+        true
+    );
+
+    if (MatchmakingSystem->StartMatchmaking(Request))
+    {
+        SetMenuState(EHSMenuState::Matchmaking);
+        OnMatchmakingStarted.Broadcast();
+    }
+    else
+    {
+        ShowErrorDialog(TEXT("커스텀 매치를 시작할 수 없습니다."));
+    }
 }
 
 void UHSMainMenuWidget::CancelMatchmaking()
@@ -378,6 +439,8 @@ void UHSMainMenuWidget::PlaySlideOutAnimation(UWidget* TargetWidget, bool bToLef
 
 void UHSMainMenuWidget::InitializeWidgetBindings()
 {
+    HideErrorDialog();
+    
     // 메인 메뉴 버튼 바인딩
     if (Button_QuickMatch)
     {
@@ -833,10 +896,47 @@ FString UHSMainMenuWidget::FormatSuccessRate(int32 Successful, int32 Total) cons
 
 void UHSMainMenuWidget::ShowErrorDialog(const FString& ErrorMessage)
 {
-    UE_LOG(LogTemp, Error, TEXT("HSMainMenuWidget: 에러 다이얼로그 - %s"), *ErrorMessage);
-    
-    // 실제 구현에서는 에러 다이얼로그 UI 표시
-    // 현재는 로그로만 출력
+    UE_LOG(LogTemp, Error, TEXT("HSMainMenuWidget: %s"), *ErrorMessage);
+
+    if (Panel_ErrorDialog && Text_ErrorMessage)
+    {
+        Panel_ErrorDialog->SetVisibility(ESlateVisibility::Visible);
+        Text_ErrorMessage->SetText(FText::FromString(ErrorMessage));
+
+        if (UWorld* World = GetWorld())
+        {
+            World->GetTimerManager().ClearTimer(ErrorDialogTimerHandle);
+            World->GetTimerManager().SetTimer(
+                ErrorDialogTimerHandle,
+                this,
+                &UHSMainMenuWidget::HideErrorDialog,
+                ErrorMessageDisplaySeconds,
+                false
+            );
+        }
+    }
+    else
+    {
+        UKismetSystemLibrary::PrintString(this, ErrorMessage, true, true, FLinearColor::Red, ErrorMessageDisplaySeconds);
+    }
+}
+
+void UHSMainMenuWidget::HideErrorDialog()
+{
+    if (UWorld* World = GetWorld())
+    {
+        World->GetTimerManager().ClearTimer(ErrorDialogTimerHandle);
+    }
+
+    if (Panel_ErrorDialog)
+    {
+        Panel_ErrorDialog->SetVisibility(ESlateVisibility::Collapsed);
+    }
+
+    if (Text_ErrorMessage)
+    {
+        Text_ErrorMessage->SetText(FText::GetEmpty());
+    }
 }
 
 // 버튼 클릭 이벤트 핸들러들
@@ -929,6 +1029,81 @@ void UHSMainMenuWidget::OnMatchmakingError(const FString& ErrorMessage)
 void UHSMainMenuWidget::OnEstimatedWaitTimeUpdated(float WaitTimeSeconds)
 {
     // UI에서 대기시간 업데이트는 UpdateMatchmakingUI에서 처리됨
+}
+
+FHSMatchmakingRequest UHSMainMenuWidget::BuildMatchmakingRequest(EHSMatchType MatchType, int32 DefaultMaxPing, bool bAllowCrossPlatform) const
+{
+    FHSMatchmakingRequest Request;
+    Request.MatchType = MatchType;
+    Request.SkillRating = CalculatePlayerSkillRating();
+    Request.PreferredRegion = ResolvePreferredRegion();
+
+    int32 DesiredMaxPing = DefaultMaxPing > 0 ? DefaultMaxPing : 100;
+    if (CurrentSaveData)
+    {
+        const int32 UserMaxPing = CurrentSaveData->NetworkSettings.MaxPingThreshold;
+        if (UserMaxPing > 0)
+        {
+            DesiredMaxPing = (MatchType == EHSMatchType::RankedMatch)
+                ? FMath::Min(UserMaxPing, DesiredMaxPing)
+                : UserMaxPing;
+        }
+    }
+
+    Request.MaxPing = FMath::Clamp(DesiredMaxPing, 50, 500);
+
+    const bool bUserAllowsCrossplay = CurrentSaveData ? CurrentSaveData->NetworkSettings.bAllowCrossPlatformPlay : true;
+    Request.bAllowCrossPlatform = bAllowCrossPlatform && bUserAllowsCrossplay;
+
+    return Request;
+}
+
+float UHSMainMenuWidget::CalculatePlayerSkillRating() const
+{
+    constexpr float BaseRating = 1000.0f;
+
+    if (!CurrentSaveData)
+    {
+        return BaseRating;
+    }
+
+    const FHSPlayerLifetimeStatistics& Stats = CurrentSaveData->PlayerProfile.Statistics;
+    if (Stats.TotalRuns <= 0)
+    {
+        return BaseRating;
+    }
+
+    const float SuccessRatio = static_cast<float>(Stats.SuccessfulRuns) / FMath::Max(Stats.TotalRuns, 1);
+    const float AverageKills = static_cast<float>(Stats.TotalEnemiesKilled) / FMath::Max(Stats.TotalRuns, 1);
+    const float BossBonus = static_cast<float>(Stats.TotalBossesKilled) * 12.5f;
+    const float DamageDifferential = (Stats.TotalDamageTaken > 0.0f)
+        ? (Stats.TotalDamageDealt - Stats.TotalDamageTaken) / 1000.0f
+        : Stats.TotalDamageDealt / 1000.0f;
+
+    float Rating = BaseRating;
+    Rating += SuccessRatio * 400.0f;
+    Rating += FMath::Clamp(AverageKills, 0.0f, 200.0f);
+    Rating += FMath::Clamp(BossBonus, 0.0f, 400.0f);
+    Rating += FMath::Clamp(DamageDifferential, -200.0f, 200.0f);
+    Rating -= FMath::Clamp(static_cast<float>(Stats.TotalDeaths) * 5.0f, 0.0f, 300.0f);
+
+    return FMath::Clamp(Rating, 200.0f, 3000.0f);
+}
+
+EHSRegion UHSMainMenuWidget::ResolvePreferredRegion() const
+{
+    if (!CurrentSaveData)
+    {
+        return EHSRegion::Auto;
+    }
+
+    const FString& PreferredRegionSetting = CurrentSaveData->NetworkSettings.PreferredRegion;
+    if (PreferredRegionSetting.IsEmpty())
+    {
+        return EHSRegion::Auto;
+    }
+
+    return ParseRegionIdentifier(PreferredRegionSetting);
 }
 
 // 설정 변경 콜백들

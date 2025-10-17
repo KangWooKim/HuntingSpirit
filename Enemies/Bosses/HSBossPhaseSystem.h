@@ -1,6 +1,5 @@
 // HSBossPhaseSystem.h
 // 보스 페이즈 시스템 컴포넌트 - 보스의 체력에 따른 페이즈 전환을 관리
-// 현업에서 사용하는 최적화 기법 적용: 오브젝트 풀링, 메모리 효율적 설계, 네트워크 복제 최적화
 
 #pragma once
 
@@ -69,7 +68,7 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnPhaseTransitionCompleted, EHSBoss
 /**
  * 보스 페이즈 시스템 컴포넌트
  * 보스의 체력에 따른 페이즈 전환을 관리하고, 전환 시 특수 효과 및 무적 시간을 처리합니다.
- * 네트워크 복제를 지원하며 현업 최적화 기법을 적용했습니다.
+ * 네트워크 복제를 지원하며 최적화된 처리를 제공합니다.
  */
 UCLASS(ClassGroup=(Custom), meta=(BlueprintSpawnableComponent))
 class HUNTINGSPIRIT_API UHSBossPhaseSystem : public UActorComponent

@@ -869,15 +869,20 @@ void AHSGameStateBase::ManageMemoryPools()
 // 오브젝트 풀 최적화
 void AHSGameStateBase::OptimizeObjectPools()
 {
-    // 협동 메커니즘 시스템의 오브젝트 풀 최적화
     if (CoopMechanics)
     {
-        // 실제 구현에서는 CoopMechanics의 최적화 메서드 호출
+        CoopMechanics->InvalidateCache();
     }
 
-    // 공유 능력 시스템의 메모리 풀 최적화
-    if (SharedAbilitySystem)
+    const int32 ActiveBossCount = WorldState.CurrentBoss.IsValid() ? 1 : 0;
+    const int32 ExpectedActiveObjects = FMath::Max(GameStatistics.TotalPlayers + WorldState.SpawnedEnemies + ActiveBossCount, 1);
+    UHSPerformanceOptimizer::PreallocateMemoryPools(ExpectedActiveObjects);
+
+    if (GameStatistics.TotalPlayers == 0)
     {
-        // 실제 구현에서는 SharedAbilitySystem의 최적화 메서드 호출
+        UHSAdvancedMemoryManager::CleanupAllPools();
     }
+
+    FPSSamples.Shrink();
+    PingSamples.Shrink();
 }

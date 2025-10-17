@@ -1,12 +1,89 @@
 #include "HSSaveGameData.h"
-#include "Engine/Engine.h"
-#include "Engine/World.h"
-#include "GameFramework/GameUserSettings.h"
 #include "AudioDevice.h"
-#include "Sound/SoundMix.h"
+#include "Engine/Engine.h"
+#include "Engine/GameInstance.h"
+#include "Engine/GameViewportClient.h"
+#include "Engine/LocalPlayer.h"
+#include "Engine/World.h"
+#include "Framework/Application/SlateApplication.h"
+#include "GameFramework/GameUserSettings.h"
+#include "GameFramework/InputSettings.h"
+#include "GameFramework/PlayerController.h"
+#include "HAL/IConsoleManager.h"
 #include "HAL/PlatformFilemanager.h"
+#include "HSSaveGameManager.h"
+#include "Misc/ConfigCacheIni.h"
 #include "Misc/DateTime.h"
 #include "Misc/Guid.h"
+#include "Misc/SecureHash.h"
+
+namespace
+{
+    UWorld* ResolvePrimaryWorld()
+    {
+        if (!GEngine)
+        {
+            return nullptr;
+        }
+
+        for (const FWorldContext& Context : GEngine->GetWorldContexts())
+        {
+            UWorld* World = Context.World();
+            if (!World)
+            {
+                continue;
+            }
+
+            if (Context.WorldType == EWorldType::Game || Context.WorldType == EWorldType::PIE)
+            {
+                return World;
+            }
+        }
+
+        return GEngine->GetWorldContexts().Num() > 0 ? GEngine->GetWorldContexts()[0].World() : nullptr;
+    }
+
+    UGameInstance* ResolvePrimaryGameInstance()
+    {
+        if (UWorld* World = ResolvePrimaryWorld())
+        {
+            return World->GetGameInstance();
+        }
+        return nullptr;
+    }
+
+    IConsoleVariable* ResolveRuntimeCVar(const TCHAR* Name, float DefaultValue)
+    {
+        static TMap<FString, IConsoleVariable*> CachedCVars;
+        if (IConsoleVariable** Found = CachedCVars.Find(FString(Name)))
+        {
+            return *Found;
+        }
+
+        IConsoleManager& ConsoleManager = IConsoleManager::Get();
+        IConsoleVariable* Variable = ConsoleManager.FindConsoleVariable(Name);
+        if (!Variable)
+        {
+            Variable = ConsoleManager.RegisterConsoleVariable(Name, DefaultValue, TEXT("Managed by HuntingSpirit save data runtime settings"), ECVF_Default);
+        }
+
+        CachedCVars.Add(FString(Name), Variable);
+        return Variable;
+    }
+
+    void SetRuntimeCVar(const TCHAR* Name, float Value)
+    {
+        if (IConsoleVariable* Variable = ResolveRuntimeCVar(Name, Value))
+        {
+            Variable->Set(Value, ECVF_SetByGameSetting);
+        }
+    }
+
+    void SetRuntimeCVarBool(const TCHAR* Name, bool bValue)
+    {
+        SetRuntimeCVar(Name, bValue ? 1.0f : 0.0f);
+    }
+}
 
 UHSSaveGameData::UHSSaveGameData()
 {
@@ -220,20 +297,106 @@ void UHSSaveGameData::ApplyInputSettings() const
 
 void UHSSaveGameData::ApplyGameplaySettings() const
 {
-    // 게임플레이 설정 적용 로직
-    // 실제 구현에서는 게임 인스턴스나 게임 모드에 설정 전달
+    if (UGameInstance* GameInstance = ResolvePrimaryGameInstance())
+    {
+        if (UHSSaveGameManager* SaveManager = GameInstance->GetSubsystem<UHSSaveGameManager>())
+        {
+            SaveManager->EnableAutoSave(GameplaySettings.bAutoSaveEnabled, GameplaySettings.AutoSaveInterval);
+        }
+
+        if (UGameViewportClient* Viewport = GameInstance->GetGameViewport())
+        {
+            const float ClampedScale = FMath::Clamp(GameplaySettings.UIScale, 0.5f, 3.0f);
+            Viewport->SetViewportScale(ClampedScale);
+            SetRuntimeCVar(TEXT("hs.UI.Scale"), ClampedScale);
+        }
+    }
+
+    SetRuntimeCVarBool(TEXT("hs.Gameplay.DamageNumbers"), GameplaySettings.bDamageNumbersEnabled);
+    SetRuntimeCVarBool(TEXT("hs.Gameplay.HealthBars"), GameplaySettings.bHealthBarsEnabled);
+    SetRuntimeCVarBool(TEXT("hs.Gameplay.Crosshair"), GameplaySettings.bCrosshairEnabled);
+    SetRuntimeCVarBool(TEXT("hs.Gameplay.Subtitles"), GameplaySettings.bSubtitlesEnabled);
+    SetRuntimeCVar(TEXT("hs.Gameplay.PreferredDifficulty"), static_cast<float>(GameplaySettings.PreferredDifficulty));
+
+    if (GConfig)
+    {
+        const TCHAR* Section = TEXT("HuntingSpirit.Gameplay");
+        GConfig->SetInt(Section, TEXT("PreferredDifficulty"), static_cast<int32>(GameplaySettings.PreferredDifficulty), GGameUserSettingsIni);
+        GConfig->SetBool(Section, TEXT("bAutoSaveEnabled"), GameplaySettings.bAutoSaveEnabled, GGameUserSettingsIni);
+        GConfig->SetFloat(Section, TEXT("AutoSaveInterval"), GameplaySettings.AutoSaveInterval, GGameUserSettingsIni);
+        GConfig->SetBool(Section, TEXT("bDamageNumbersEnabled"), GameplaySettings.bDamageNumbersEnabled, GGameUserSettingsIni);
+        GConfig->SetBool(Section, TEXT("bHealthBarsEnabled"), GameplaySettings.bHealthBarsEnabled, GGameUserSettingsIni);
+        GConfig->SetBool(Section, TEXT("bCrosshairEnabled"), GameplaySettings.bCrosshairEnabled, GGameUserSettingsIni);
+        GConfig->SetBool(Section, TEXT("bSubtitlesEnabled"), GameplaySettings.bSubtitlesEnabled, GGameUserSettingsIni);
+        GConfig->SetFloat(Section, TEXT("UIScale"), GameplaySettings.UIScale, GGameUserSettingsIni);
+        GConfig->Flush(false, GGameUserSettingsIni);
+    }
+
+    if (UGameUserSettings* UserSettings = UGameUserSettings::GetGameUserSettings())
+    {
+        UserSettings->ApplySettings(false);
+    }
+
     UE_LOG(LogTemp, Log, TEXT("HSSaveGameData: 게임플레이 설정 적용 완료"));
 }
 
 void UHSSaveGameData::ApplyNetworkSettings() const
 {
-    // 네트워크 설정 적용 로직
+    SetRuntimeCVar(TEXT("hs.Network.MaxPingThreshold"), static_cast<float>(NetworkSettings.MaxPingThreshold));
+    SetRuntimeCVarBool(TEXT("hs.Network.ShowPing"), NetworkSettings.bShowPing);
+    SetRuntimeCVarBool(TEXT("hs.Network.AutoReconnect"), NetworkSettings.bAutoConnectToLastServer);
+    SetRuntimeCVarBool(TEXT("hs.Network.AllowCrossPlay"), NetworkSettings.bAllowCrossPlatformPlay);
+
+    if (IConsoleVariable* MaxPredictionPing = IConsoleManager::Get().FindConsoleVariable(TEXT("net.MaxPredictionPing")))
+    {
+        MaxPredictionPing->Set(NetworkSettings.MaxPingThreshold, ECVF_SetByGameSetting);
+    }
+
+    if (IConsoleVariable* ShowPing = IConsoleManager::Get().FindConsoleVariable(TEXT("net.DisplayPing")))
+    {
+        ShowPing->Set(NetworkSettings.bShowPing ? 1 : 0, ECVF_SetByGameSetting);
+    }
+
+    if (GConfig)
+    {
+        const TCHAR* Section = TEXT("HuntingSpirit.Network");
+        GConfig->SetInt(Section, TEXT("MaxPingThreshold"), NetworkSettings.MaxPingThreshold, GGameUserSettingsIni);
+        GConfig->SetBool(Section, TEXT("bShowPing"), NetworkSettings.bShowPing, GGameUserSettingsIni);
+        GConfig->SetBool(Section, TEXT("bAutoConnectToLastServer"), NetworkSettings.bAutoConnectToLastServer, GGameUserSettingsIni);
+        GConfig->SetString(Section, TEXT("LastServerAddress"), *NetworkSettings.LastServerAddress, GGameUserSettingsIni);
+        GConfig->SetString(Section, TEXT("PreferredRegion"), *NetworkSettings.PreferredRegion, GGameUserSettingsIni);
+        GConfig->SetBool(Section, TEXT("bAllowCrossPlatformPlay"), NetworkSettings.bAllowCrossPlatformPlay, GGameUserSettingsIni);
+        GConfig->Flush(false, GGameUserSettingsIni);
+    }
+
     UE_LOG(LogTemp, Log, TEXT("HSSaveGameData: 네트워크 설정 적용 완료"));
 }
 
 void UHSSaveGameData::ApplyAccessibilitySettings() const
 {
-    // 접근성 설정 적용 로직
+    SetRuntimeCVarBool(TEXT("hs.Accessibility.ColorBlindMode"), AccessibilitySettings.bColorBlindMode);
+    SetRuntimeCVar(TEXT("hs.Accessibility.TextScale"), AccessibilitySettings.TextSize);
+    SetRuntimeCVarBool(TEXT("hs.Accessibility.HighContrastMode"), AccessibilitySettings.bHighContrastMode);
+    SetRuntimeCVarBool(TEXT("hs.Accessibility.ReduceMotion"), AccessibilitySettings.bReduceMotion);
+    SetRuntimeCVarBool(TEXT("hs.Accessibility.ScreenReader"), AccessibilitySettings.bScreenReaderSupport);
+
+    if (FSlateApplication::IsInitialized())
+    {
+        const float ClampedScale = FMath::Clamp(AccessibilitySettings.TextSize, 0.5f, 2.5f);
+        FSlateApplication::Get().SetApplicationScale(ClampedScale);
+    }
+
+    if (GConfig)
+    {
+        const TCHAR* Section = TEXT("HuntingSpirit.Accessibility");
+        GConfig->SetBool(Section, TEXT("bColorBlindMode"), AccessibilitySettings.bColorBlindMode, GGameUserSettingsIni);
+        GConfig->SetFloat(Section, TEXT("TextSize"), AccessibilitySettings.TextSize, GGameUserSettingsIni);
+        GConfig->SetBool(Section, TEXT("bHighContrastMode"), AccessibilitySettings.bHighContrastMode, GGameUserSettingsIni);
+        GConfig->SetBool(Section, TEXT("bReduceMotion"), AccessibilitySettings.bReduceMotion, GGameUserSettingsIni);
+        GConfig->SetBool(Section, TEXT("bScreenReaderSupport"), AccessibilitySettings.bScreenReaderSupport, GGameUserSettingsIni);
+        GConfig->Flush(false, GGameUserSettingsIni);
+    }
+
     UE_LOG(LogTemp, Log, TEXT("HSSaveGameData: 접근성 설정 적용 완료"));
 }
 
@@ -654,29 +817,91 @@ bool UHSSaveGameData::ValidateMetaCurrencies() const
 
 void UHSSaveGameData::ApplyAudioSettingsToEngine() const
 {
-    // 엔진 오디오 설정 적용
+    const float MasterVolume = AudioSettings.bMasterMuted ? 0.0f : AudioSettings.MasterVolume;
+    const float SfxVolume = AudioSettings.bSFXMuted ? 0.0f : AudioSettings.SFXVolume;
+    const float MusicVolume = AudioSettings.bMusicMuted ? 0.0f : AudioSettings.MusicVolume;
+    const float VoiceVolume = AudioSettings.bVoiceMuted ? 0.0f : AudioSettings.VoiceVolume;
+    const float AmbientVolume = AudioSettings.bAmbientMuted ? 0.0f : AudioSettings.AmbientVolume;
+
     if (GEngine)
     {
-        FAudioDevice* AudioDevice = GEngine->GetMainAudioDeviceRaw();
-        if (AudioDevice)
+        if (FAudioDevice* AudioDevice = GEngine->GetMainAudioDeviceRaw())
         {
-            // 마스터 볼륨 설정
-            if (!AudioSettings.bMasterMuted)
-            {
-                AudioDevice->SetGlobalPitchModulation(AudioSettings.MasterVolume, 0.0f);
-            }
-            
-            // 개별 볼륨 설정 (실제 구현에서는 사운드 클래스별 설정)
+            AudioDevice->SetTransientMasterVolume(MasterVolume);
         }
+    }
+
+    SetRuntimeCVar(TEXT("hs.Audio.MasterVolume"), MasterVolume);
+    SetRuntimeCVar(TEXT("hs.Audio.SFXVolume"), SfxVolume);
+    SetRuntimeCVar(TEXT("hs.Audio.MusicVolume"), MusicVolume);
+    SetRuntimeCVar(TEXT("hs.Audio.VoiceVolume"), VoiceVolume);
+    SetRuntimeCVar(TEXT("hs.Audio.AmbientVolume"), AmbientVolume);
+
+    if (GConfig)
+    {
+        const TCHAR* Section = TEXT("HuntingSpirit.Audio");
+        GConfig->SetFloat(Section, TEXT("MasterVolume"), AudioSettings.MasterVolume, GGameUserSettingsIni);
+        GConfig->SetFloat(Section, TEXT("SFXVolume"), AudioSettings.SFXVolume, GGameUserSettingsIni);
+        GConfig->SetFloat(Section, TEXT("MusicVolume"), AudioSettings.MusicVolume, GGameUserSettingsIni);
+        GConfig->SetFloat(Section, TEXT("VoiceVolume"), AudioSettings.VoiceVolume, GGameUserSettingsIni);
+        GConfig->SetFloat(Section, TEXT("AmbientVolume"), AudioSettings.AmbientVolume, GGameUserSettingsIni);
+        GConfig->SetBool(Section, TEXT("bMasterMuted"), AudioSettings.bMasterMuted, GGameUserSettingsIni);
+        GConfig->SetBool(Section, TEXT("bSFXMuted"), AudioSettings.bSFXMuted, GGameUserSettingsIni);
+        GConfig->SetBool(Section, TEXT("bMusicMuted"), AudioSettings.bMusicMuted, GGameUserSettingsIni);
+        GConfig->SetBool(Section, TEXT("bVoiceMuted"), AudioSettings.bVoiceMuted, GGameUserSettingsIni);
+        GConfig->SetBool(Section, TEXT("bAmbientMuted"), AudioSettings.bAmbientMuted, GGameUserSettingsIni);
+        GConfig->Flush(false, GGameUserSettingsIni);
     }
 }
 
 void UHSSaveGameData::ApplyInputSettingsToEngine() const
 {
-    // 입력 설정 엔진 적용
-    if (UGameUserSettings* UserSettings = UGameUserSettings::GetGameUserSettings())
+    SetRuntimeCVar(TEXT("hs.Input.MouseSensitivity"), InputSettings.MouseSensitivity);
+    SetRuntimeCVar(TEXT("hs.Input.ControllerSensitivity"), InputSettings.ControllerSensitivity);
+    SetRuntimeCVarBool(TEXT("hs.Input.InvertMouseY"), InputSettings.bInvertMouseY);
+    SetRuntimeCVarBool(TEXT("hs.Input.InvertControllerY"), InputSettings.bInvertControllerY);
+    SetRuntimeCVarBool(TEXT("hs.Input.ControllerVibration"), InputSettings.bControllerVibrationsEnabled);
+
+    if (GConfig)
     {
-        // 마우스 감도 등 입력 관련 설정
-        // 실제 구현에서는 게임 인스턴스나 플레이어 컨트롤러에 전달
+        const TCHAR* Section = TEXT("HuntingSpirit.Input");
+        GConfig->SetFloat(Section, TEXT("MouseSensitivity"), InputSettings.MouseSensitivity, GInputIni);
+        GConfig->SetFloat(Section, TEXT("ControllerSensitivity"), InputSettings.ControllerSensitivity, GInputIni);
+        GConfig->SetBool(Section, TEXT("bInvertMouseY"), InputSettings.bInvertMouseY, GInputIni);
+        GConfig->SetBool(Section, TEXT("bInvertControllerY"), InputSettings.bInvertControllerY, GInputIni);
+        GConfig->SetBool(Section, TEXT("bControllerVibrationsEnabled"), InputSettings.bControllerVibrationsEnabled, GInputIni);
+        for (const TPair<FString, FString>& Binding : InputSettings.KeyBindings)
+        {
+            const FString ConfigKey = FString::Printf(TEXT("KeyBinding_%s"), *Binding.Key);
+            GConfig->SetString(Section, *ConfigKey, *Binding.Value, GInputIni);
+        }
+        GConfig->Flush(false, GInputIni);
+    }
+
+    if (UInputSettings* EngineInputSettings = UInputSettings::GetInputSettings())
+    {
+        const TArray<FInputActionKeyMapping> ExistingMappings = EngineInputSettings->GetActionMappings();
+        for (const TPair<FString, FString>& Binding : InputSettings.KeyBindings)
+        {
+            const FName ActionName(*Binding.Key);
+            const FKey DesiredKey(FName(*Binding.Value));
+            if (!DesiredKey.IsValid())
+            {
+                continue;
+            }
+
+            for (const FInputActionKeyMapping& Mapping : ExistingMappings)
+            {
+                if (Mapping.ActionName == ActionName)
+                {
+                    EngineInputSettings->RemoveActionMapping(Mapping, false);
+                }
+            }
+
+            EngineInputSettings->AddActionMapping(FInputActionKeyMapping(ActionName, DesiredKey), false);
+        }
+
+        EngineInputSettings->SaveKeyMappings();
+        EngineInputSettings->ForceRebuildKeymaps();
     }
 }

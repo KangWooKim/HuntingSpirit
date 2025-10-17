@@ -603,9 +603,9 @@ float AHSPlayerState::GetPacketLossRate() const
     {
         if (UNetConnection* NetConnection = PC->GetNetConnection())
         {
-            // UE5.4에서는 패킷 손실률을 네트워크 드라이버에서 가져옴
-            // 기본값으로 0.0f를 반환 (실제 구현은 네트워크 드라이버에서 처리)
-            return 0.0f;
+            const float IncomingLoss = NetConnection->GetInLossPercentage().GetAvgLossPercentage();
+            const float OutgoingLoss = NetConnection->GetOutLossPercentage().GetAvgLossPercentage();
+            return FMath::Clamp((IncomingLoss + OutgoingLoss) * 0.5f, 0.0f, 100.0f);
         }
     }
     return 0.0f;

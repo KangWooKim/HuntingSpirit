@@ -7,10 +7,20 @@
 #include "Misc/Paths.h"
 #include "Misc/DateTime.h"
 #include "Misc/Guid.h"
+#include "Containers/StringConv.h"
+#include "Misc/Compression.h"
+#include "Misc/Crc.h"
 #include "Serialization/ObjectAndNameAsStringProxyArchive.h"
 #include "Serialization/MemoryWriter.h"
 #include "Serialization/MemoryReader.h"
+#include "Serialization/JsonWriter.h"
+#include "Serialization/JsonReader.h"
+#include "Serialization/JsonSerializer.h"
+#include "Dom/JsonObject.h"
+#include "Policies/CondensedJsonPrintPolicy.h"
 #include "Compression/CompressionUtil.h"
+#include "Misc/SecureHash.h"
+#include "UObject/UObjectGlobals.h"
 
 UHSSaveGameManager::UHSSaveGameManager()
 {
@@ -205,8 +215,11 @@ bool UHSSaveGameManager::SaveGameSync(int32 SlotIndex, UHSSaveGameData* SaveData
     if (bCompressionEnabled)
     {
         FinalData = CompressData(*SaveBuffer);
-        UE_LOG(LogTemp, Log, TEXT("HSSaveGameManager: 데이터 압축 완료 - %d -> %d 바이트"), 
-               SaveBuffer->Num(), FinalData.Num());
+        if (FinalData.Num() > 0)
+        {
+            UE_LOG(LogTemp, Log, TEXT("HSSaveGameManager: 데이터 압축 완료 - %d -> %d 바이트"), 
+                   SaveBuffer->Num(), FinalData.Num());
+        }
     }
     else
     {
@@ -217,8 +230,20 @@ bool UHSSaveGameManager::SaveGameSync(int32 SlotIndex, UHSSaveGameData* SaveData
     if (bEncryptionEnabled && !EncryptionKey.IsEmpty())
     {
         FinalData = EncryptData(FinalData);
-        UE_LOG(LogTemp, Log, TEXT("HSSaveGameManager: 데이터 암호화 완료"));
+        if (FinalData.Num() > 0)
+        {
+            UE_LOG(LogTemp, Log, TEXT("HSSaveGameManager: 데이터 암호화 완료"));
+        }
     }
+
+    if (FinalData.Num() == 0)
+    {
+        UE_LOG(LogTemp, Error, TEXT("HSSaveGameManager: 저장 데이터 준비 실패 - 빈 데이터"));
+        ReturnPooledBuffer(SaveBuffer);
+        return false;
+    }
+
+    const uint32 DataChecksum = CalculateChecksum(FinalData);
     
     // 파일 저장
     FString FilePath = GetSlotFilePath(SlotIndex);
@@ -238,6 +263,7 @@ bool UHSSaveGameManager::SaveGameSync(int32 SlotIndex, UHSSaveGameData* SaveData
         SlotInfo.bIsAutosave = (SlotIndex == AutoSaveSlotIndex);
         SlotInfo.FileSizeMB = FinalData.Num() / (1024.0f * 1024.0f);
         SlotInfo.SaveDataVersion = SaveData->SaveDataVersion;
+        SlotInfo.Checksum = DataChecksum;
         
         SaveSlotMetadata(SlotIndex, SlotInfo);
         
@@ -302,20 +328,30 @@ UHSSaveGameData* UHSSaveGameManager::LoadGameSync(int32 SlotIndex)
     if (bEncryptionEnabled && !EncryptionKey.IsEmpty())
     {
         FileData = DecryptData(FileData);
+        if (FileData.Num() == 0)
+        {
+            UE_LOG(LogTemp, Error, TEXT("HSSaveGameManager: 데이터 복호화 실패 - 슬롯 %d"), SlotIndex);
+            return nullptr;
+        }
         UE_LOG(LogTemp, Log, TEXT("HSSaveGameManager: 데이터 복호화 완료"));
     }
     
     // 압축 해제
-    TArray<uint8> DecompressedData;
+    TArray<uint8> WorkingData;
     if (bCompressionEnabled)
     {
-        DecompressedData = DecompressData(FileData);
+        WorkingData = DecompressData(FileData);
+        if (WorkingData.Num() == 0)
+        {
+            UE_LOG(LogTemp, Error, TEXT("HSSaveGameManager: 데이터 압축 해제 실패 - 슬롯 %d"), SlotIndex);
+            return nullptr;
+        }
         UE_LOG(LogTemp, Log, TEXT("HSSaveGameManager: 데이터 압축 해제 완료 - %d -> %d 바이트"), 
-               FileData.Num(), DecompressedData.Num());
+               FileData.Num(), WorkingData.Num());
     }
     else
     {
-        DecompressedData = FileData;
+        WorkingData = FileData;
     }
     
     // 저장 데이터 역직렬화
@@ -326,7 +362,7 @@ UHSSaveGameData* UHSSaveGameManager::LoadGameSync(int32 SlotIndex)
         return nullptr;
     }
     
-    FMemoryReader MemoryReader(DecompressedData, true);
+    FMemoryReader MemoryReader(WorkingData, true);
     FObjectAndNameAsStringProxyArchive Ar(MemoryReader, false);
     LoadedData->Serialize(Ar);
     
@@ -423,13 +459,17 @@ FHSSaveSlotInfo UHSSaveGameManager::GetSaveSlotInfo(int32 SlotIndex) const
     FScopeLock Lock(&CacheMutex);
     
     // 캐시에서 확인
-    if (SlotInfoCache.Contains(SlotIndex))
+    const FString FilePath = GetSlotFilePath(SlotIndex);
+    
+    if (FHSSaveSlotInfo* CachedInfo = SlotInfoCache.Find(SlotIndex))
     {
-        return SlotInfoCache[SlotIndex];
+        CachedInfo->bIsValid = ValidateSaveFile(FilePath);
+        return *CachedInfo;
     }
     
     // 캐시에 없으면 로드
     FHSSaveSlotInfo SlotInfo = LoadSlotMetadata(SlotIndex);
+    SlotInfo.bIsValid = ValidateSaveFile(FilePath);
     SlotInfoCache.Add(SlotIndex, SlotInfo);
     
     return SlotInfo;
@@ -781,7 +821,6 @@ void UHSSaveGameManager::PerformSaveOperation(int32 SlotIndex, UHSSaveGameData* 
     
     UpdateOperationProgress(0.3f, TEXT("데이터 직렬화 중..."));
     
-    // 실제 저장 작업
     bool bSuccess = SaveGameSync(SlotIndex, SaveData);
     
     UpdateOperationProgress(1.0f, TEXT("저장 완료"));
@@ -796,7 +835,6 @@ void UHSSaveGameManager::PerformLoadOperation(int32 SlotIndex)
     
     UpdateOperationProgress(0.5f, TEXT("데이터 역직렬화 중..."));
     
-    // 실제 로드 작업
     UHSSaveGameData* LoadedData = LoadGameSync(SlotIndex);
     
     UpdateOperationProgress(1.0f, TEXT("로드 완료"));
@@ -860,53 +898,171 @@ bool UHSSaveGameManager::WriteToFile(const FString& FilePath, const TArray<uint8
     return FFileHelper::SaveArrayToFile(Data, *FilePath);
 }
 
-bool UHSSaveGameManager::ReadFromFile(const FString& FilePath, TArray<uint8>& OutData)
+bool UHSSaveGameManager::ReadFromFile(const FString& FilePath, TArray<uint8>& OutData) const
 {
     return FFileHelper::LoadFileToArray(OutData, *FilePath);
 }
 
 TArray<uint8> UHSSaveGameManager::CompressData(const TArray<uint8>& Data) const
 {
-    // 실제 구현에서는 UE4/5의 압축 라이브러리 사용
-    // 현재는 시뮬레이션
-    TArray<uint8> CompressedData = Data;
-    // 압축 시뮬레이션 (실제로는 zlib 등 사용)
-    return CompressedData;
+    if (Data.Num() == 0)
+    {
+        return TArray<uint8>();
+    }
+
+    const int32 UncompressedSize = Data.Num();
+    int32 CompressedBound = FCompression::CompressMemoryBound(NAME_Zlib, UncompressedSize);
+
+    TArray<uint8> CompressedPayload;
+    CompressedPayload.SetNumUninitialized(CompressedBound);
+
+    int32 CompressedSize = CompressedBound;
+    if (!FCompression::CompressMemory(NAME_Zlib, CompressedPayload.GetData(), CompressedSize, Data.GetData(), UncompressedSize))
+    {
+        UE_LOG(LogTemp, Warning, TEXT("HSSaveGameManager: 데이터 압축 실패, 원본 데이터를 유지합니다"));
+        return Data;
+    }
+
+    CompressedPayload.SetNum(CompressedSize);
+
+    TArray<uint8> Result;
+    Result.SetNumUninitialized(sizeof(int32) + CompressedPayload.Num());
+    FMemory::Memcpy(Result.GetData(), &UncompressedSize, sizeof(int32));
+    FMemory::Memcpy(Result.GetData() + sizeof(int32), CompressedPayload.GetData(), CompressedPayload.Num());
+    return Result;
 }
 
 TArray<uint8> UHSSaveGameManager::DecompressData(const TArray<uint8>& CompressedData) const
 {
-    // 실제 구현에서는 UE4/5의 압축 해제 라이브러리 사용
-    // 현재는 시뮬레이션
-    TArray<uint8> DecompressedData = CompressedData;
-    return DecompressedData;
+    if (CompressedData.Num() < static_cast<int32>(sizeof(int32)))
+    {
+        return TArray<uint8>();
+    }
+
+    int32 UncompressedSize = 0;
+    FMemory::Memcpy(&UncompressedSize, CompressedData.GetData(), sizeof(int32));
+    if (UncompressedSize <= 0)
+    {
+        return TArray<uint8>();
+    }
+
+    const int32 PayloadSize = CompressedData.Num() - sizeof(int32);
+    const uint8* Payload = CompressedData.GetData() + sizeof(int32);
+
+    TArray<uint8> Result;
+    Result.SetNumUninitialized(UncompressedSize);
+
+    if (!FCompression::UncompressMemory(NAME_Zlib, Result.GetData(), UncompressedSize, Payload, PayloadSize))
+    {
+        UE_LOG(LogTemp, Error, TEXT("HSSaveGameManager: 압축 해제 실패"));
+        return TArray<uint8>();
+    }
+
+    return Result;
 }
 
 TArray<uint8> UHSSaveGameManager::EncryptData(const TArray<uint8>& Data) const
 {
-    // 실제 구현에서는 AES 등의 암호화 사용
-    // 현재는 간단한 XOR 시뮬레이션
-    TArray<uint8> EncryptedData = Data;
-    
-    if (!EncryptionKey.IsEmpty())
+    if (Data.Num() == 0 || EncryptionKey.IsEmpty())
     {
-        TArray<uint8> KeyBytes;
-        FTCHARToUTF8 KeyConverter(*EncryptionKey);
-        KeyBytes.Append(reinterpret_cast<const uint8*>(KeyConverter.Get()), KeyConverter.Length());
-        
-        for (int32 i = 0; i < EncryptedData.Num(); ++i)
-        {
-            EncryptedData[i] ^= KeyBytes[i % KeyBytes.Num()];
-        }
+        return Data;
     }
-    
-    return EncryptedData;
+
+    const int32 PayloadSize = Data.Num();
+    TArray<uint8> Buffer;
+    Buffer.SetNumUninitialized(sizeof(int32) + PayloadSize);
+    FMemory::Memcpy(Buffer.GetData(), &PayloadSize, sizeof(int32));
+    FMemory::Memcpy(Buffer.GetData() + sizeof(int32), Data.GetData(), PayloadSize);
+
+    TArray<uint8> KeyBytes;
+    {
+        FTCHARToUTF8 Utf8Converter(*EncryptionKey);
+        KeyBytes.Append(reinterpret_cast<const uint8*>(Utf8Converter.Get()), Utf8Converter.Length());
+    }
+
+    if (KeyBytes.Num() == 0)
+    {
+        return Buffer;
+    }
+
+    TArray<uint8> SeedBuffer;
+    SeedBuffer.SetNumUninitialized(KeyBytes.Num() + sizeof(uint64));
+    FMemory::Memcpy(SeedBuffer.GetData(), KeyBytes.GetData(), KeyBytes.Num());
+
+    uint8 HashOutput[32];
+    uint64 Counter = 0;
+    for (int32 Offset = 0; Offset < Buffer.Num();)
+    {
+        FMemory::Memcpy(SeedBuffer.GetData() + KeyBytes.Num(), &Counter, sizeof(uint64));
+        FSHA256::HashBuffer(SeedBuffer.GetData(), SeedBuffer.Num(), HashOutput);
+
+        for (int32 HashIndex = 0; HashIndex < 32 && Offset < Buffer.Num(); ++HashIndex, ++Offset)
+        {
+            Buffer[Offset] ^= HashOutput[HashIndex];
+        }
+
+        ++Counter;
+    }
+
+    return Buffer;
 }
 
 TArray<uint8> UHSSaveGameManager::DecryptData(const TArray<uint8>& EncryptedData) const
 {
-    // XOR 암호화는 대칭이므로 같은 방법으로 복호화
-    return EncryptData(EncryptedData);
+    if (EncryptedData.Num() == 0 || EncryptionKey.IsEmpty())
+    {
+        return EncryptedData;
+    }
+
+    TArray<uint8> Buffer = EncryptedData;
+
+    TArray<uint8> KeyBytes;
+    {
+        FTCHARToUTF8 Utf8Converter(*EncryptionKey);
+        KeyBytes.Append(reinterpret_cast<const uint8*>(Utf8Converter.Get()), Utf8Converter.Length());
+    }
+
+    if (KeyBytes.Num() == 0)
+    {
+        return TArray<uint8>();
+    }
+
+    TArray<uint8> SeedBuffer;
+    SeedBuffer.SetNumUninitialized(KeyBytes.Num() + sizeof(uint64));
+    FMemory::Memcpy(SeedBuffer.GetData(), KeyBytes.GetData(), KeyBytes.Num());
+
+    uint8 HashOutput[32];
+    uint64 Counter = 0;
+
+    for (int32 Offset = 0; Offset < Buffer.Num();)
+    {
+        FMemory::Memcpy(SeedBuffer.GetData() + KeyBytes.Num(), &Counter, sizeof(uint64));
+        FSHA256::HashBuffer(SeedBuffer.GetData(), SeedBuffer.Num(), HashOutput);
+
+        for (int32 HashIndex = 0; HashIndex < 32 && Offset < Buffer.Num(); ++HashIndex, ++Offset)
+        {
+            Buffer[Offset] ^= HashOutput[HashIndex];
+        }
+
+        ++Counter;
+    }
+
+    if (Buffer.Num() < static_cast<int32>(sizeof(int32)))
+    {
+        return TArray<uint8>();
+    }
+
+    int32 OriginalSize = 0;
+    FMemory::Memcpy(&OriginalSize, Buffer.GetData(), sizeof(int32));
+    if (OriginalSize < 0 || OriginalSize > Buffer.Num() - static_cast<int32>(sizeof(int32)))
+    {
+        return TArray<uint8>();
+    }
+
+    TArray<uint8> Result;
+    Result.SetNumUninitialized(OriginalSize);
+    FMemory::Memcpy(Result.GetData(), Buffer.GetData() + sizeof(int32), OriginalSize);
+    return Result;
 }
 
 FString UHSSaveGameManager::GetSlotFilePath(int32 SlotIndex) const
@@ -958,46 +1114,155 @@ bool UHSSaveGameManager::ValidateSaveFile(const FString& FilePath) const
         return false;
     }
     
-    // 실제 구현에서는 체크섬 검증 등 수행
-    return true;
+    TArray<uint8> FileData;
+    if (!ReadFromFile(FilePath, FileData))
+    {
+        return false;
+    }
+
+    const uint32 ActualChecksum = CalculateChecksum(FileData);
+
+    uint32 ExpectedChecksum = 0;
+    const FString MetadataPath = FilePath + TEXT(".meta");
+    FString MetadataContent;
+    if (FFileHelper::LoadFileToString(MetadataContent, *MetadataPath))
+    {
+        TSharedPtr<FJsonObject> MetadataJson;
+        const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(MetadataContent);
+        if (FJsonSerializer::Deserialize(Reader, MetadataJson) && MetadataJson.IsValid())
+        {
+            double StoredChecksum = 0.0;
+            if (MetadataJson->TryGetNumberField(TEXT("Checksum"), StoredChecksum))
+            {
+                ExpectedChecksum = static_cast<uint32>(StoredChecksum);
+            }
+        }
+    }
+
+    if (ExpectedChecksum != 0 && ExpectedChecksum != ActualChecksum)
+    {
+        UE_LOG(LogTemp, Warning, TEXT("HSSaveGameManager: 체크섬 불일치 - 예상 %u, 실제 %u"), ExpectedChecksum, ActualChecksum);
+        return false;
+    }
+
+    TArray<uint8> WorkingData = FileData;
+    if (bEncryptionEnabled && !EncryptionKey.IsEmpty())
+    {
+        WorkingData = DecryptData(WorkingData);
+        if (WorkingData.Num() == 0)
+        {
+            return false;
+        }
+    }
+
+    if (bCompressionEnabled)
+    {
+        WorkingData = DecompressData(WorkingData);
+        if (WorkingData.Num() == 0)
+        {
+            return false;
+        }
+    }
+
+    UHSSaveGameData* TempSaveData = NewObject<UHSSaveGameData>(GetTransientPackage());
+    if (!TempSaveData)
+    {
+        return false;
+    }
+
+    FMemoryReader MemoryReader(WorkingData, true);
+    FObjectAndNameAsStringProxyArchive Ar(MemoryReader, false);
+    TempSaveData->Serialize(Ar);
+    TempSaveData->UpgradeSaveDataVersion();
+    return TempSaveData->ValidateSaveData();
 }
 
 uint32 UHSSaveGameManager::CalculateChecksum(const TArray<uint8>& Data) const
 {
-    // 간단한 체크섬 계산 (실제로는 CRC32 등 사용)
-    uint32 Checksum = 0;
-    for (uint8 Byte : Data)
-    {
-        Checksum += Byte;
-    }
-    return Checksum;
+    return Data.Num() > 0 ? FCrc::MemCrc32(Data.GetData(), Data.Num()) : 0;
 }
 
 void UHSSaveGameManager::PerformCloudUpload(int32 SlotIndex)
 {
-    // 클라우드 업로드 시뮬레이션
-    UE_LOG(LogTemp, Log, TEXT("HSSaveGameManager: 클라우드 업로드 시작 - 슬롯 %d"), SlotIndex);
-    
+    const FString SourcePath = GetSlotFilePath(SlotIndex);
+    if (!FPlatformFileManager::Get().GetPlatformFile().FileExists(*SourcePath))
+    {
+        UE_LOG(LogTemp, Warning, TEXT("HSSaveGameManager: 업로드할 파일이 없습니다 - 슬롯 %d"), SlotIndex);
+        return;
+    }
+
+    const FString CloudDirectory = SaveDirectory / TEXT("Cloud");
+    EnsureDirectoryExists(CloudDirectory);
+
     CloudSyncStatus.bIsSyncing = true;
-    CloudSyncStatus.LastSyncTime = FDateTime::Now();
-    
-    // 실제 구현에서는 Steam Cloud, Epic Games Store 등의 API 사용
-    
+    OnCloudSyncStatusChanged.Broadcast(CloudSyncStatus);
+
+    const FString DestinationPath = CloudDirectory / FPaths::GetCleanFilename(SourcePath);
+    const bool bDataCopied = CopyFile(SourcePath, DestinationPath);
+
+    const FString SourceMetadata = SourcePath + TEXT(".meta");
+    const FString DestinationMetadata = DestinationPath + TEXT(".meta");
+    bool bMetadataCopied = true;
+    if (FPlatformFileManager::Get().GetPlatformFile().FileExists(*SourceMetadata))
+    {
+        bMetadataCopied = CopyFile(SourceMetadata, DestinationMetadata);
+    }
+
     CloudSyncStatus.bIsSyncing = false;
+    if (bDataCopied && bMetadataCopied)
+    {
+        CloudSyncStatus.LastSyncTime = FDateTime::Now();
+        CloudSyncStatus.LastError.Empty();
+        UE_LOG(LogTemp, Log, TEXT("HSSaveGameManager: 클라우드 업로드 완료 - 슬롯 %d"), SlotIndex);
+    }
+    else
+    {
+        CloudSyncStatus.LastError = TEXT("Failed to copy save data to cloud storage");
+        UE_LOG(LogTemp, Error, TEXT("HSSaveGameManager: 클라우드 업로드 실패 - 슬롯 %d"), SlotIndex);
+    }
+
     OnCloudSyncStatusChanged.Broadcast(CloudSyncStatus);
 }
 
 void UHSSaveGameManager::PerformCloudDownload(int32 SlotIndex)
 {
-    // 클라우드 다운로드 시뮬레이션
-    UE_LOG(LogTemp, Log, TEXT("HSSaveGameManager: 클라우드 다운로드 시작 - 슬롯 %d"), SlotIndex);
-    
+    const FString CloudDirectory = SaveDirectory / TEXT("Cloud");
+    const FString SourcePath = CloudDirectory / FString::Printf(TEXT("SaveSlot_%03d.sav"), SlotIndex);
+
+    if (!FPlatformFileManager::Get().GetPlatformFile().FileExists(*SourcePath))
+    {
+        UE_LOG(LogTemp, Warning, TEXT("HSSaveGameManager: 클라우드에 파일이 없습니다 - 슬롯 %d"), SlotIndex);
+        return;
+    }
+
     CloudSyncStatus.bIsSyncing = true;
-    
-    // 실제 구현에서는 Steam Cloud, Epic Games Store 등의 API 사용
-    
+    OnCloudSyncStatusChanged.Broadcast(CloudSyncStatus);
+
+    const FString DestinationPath = GetSlotFilePath(SlotIndex);
+    const bool bDataCopied = CopyFile(SourcePath, DestinationPath);
+
+    const FString SourceMetadata = SourcePath + TEXT(".meta");
+    const FString DestinationMetadata = DestinationPath + TEXT(".meta");
+    bool bMetadataCopied = true;
+    if (FPlatformFileManager::Get().GetPlatformFile().FileExists(*SourceMetadata))
+    {
+        bMetadataCopied = CopyFile(SourceMetadata, DestinationMetadata);
+    }
+
     CloudSyncStatus.bIsSyncing = false;
-    CloudSyncStatus.LastSyncTime = FDateTime::Now();
+    if (bDataCopied && bMetadataCopied)
+    {
+        CloudSyncStatus.LastSyncTime = FDateTime::Now();
+        CloudSyncStatus.LastError.Empty();
+        InvalidateSlotInfoCache();
+        UE_LOG(LogTemp, Log, TEXT("HSSaveGameManager: 클라우드 다운로드 완료 - 슬롯 %d"), SlotIndex);
+    }
+    else
+    {
+        CloudSyncStatus.LastError = TEXT("Failed to download save data from cloud storage");
+        UE_LOG(LogTemp, Error, TEXT("HSSaveGameManager: 클라우드 다운로드 실패 - 슬롯 %d"), SlotIndex);
+    }
+
     OnCloudSyncStatusChanged.Broadcast(CloudSyncStatus);
 }
 
@@ -1108,32 +1373,28 @@ void UHSSaveGameManager::LogSaveSystemEvent(const FString& Event, const FString&
 bool UHSSaveGameManager::SaveSlotMetadata(int32 SlotIndex, const FHSSaveSlotInfo& SlotInfo)
 {
     FString MetadataPath = GetSlotFilePath(SlotIndex) + TEXT(".meta");
-    FString MetadataJson = FString::Printf(
-        TEXT("{"
-             "\"SlotIndex\":%d,"
-             "\"SlotName\":\"%s\","
-             "\"PlayerName\":\"%s\","
-             "\"PlayerLevel\":%d,"
-             "\"TotalPlayTime\":%d,"
-             "\"SaveDate\":\"%s\","
-             "\"IsValid\":%s,"
-             "\"IsAutosave\":%s,"
-             "\"FileSizeMB\":%.2f,"
-             "\"SaveDataVersion\":%d"
-             "}"),
-        SlotInfo.SlotIndex,
-        *SlotInfo.SlotName,
-        *SlotInfo.PlayerName,
-        SlotInfo.PlayerLevel,
-        SlotInfo.TotalPlayTime,
-        *SlotInfo.SaveDate.ToString(),
-        SlotInfo.bIsValid ? TEXT("true") : TEXT("false"),
-        SlotInfo.bIsAutosave ? TEXT("true") : TEXT("false"),
-        SlotInfo.FileSizeMB,
-        SlotInfo.SaveDataVersion
-    );
-    
-    return FFileHelper::SaveStringToFile(MetadataJson, *MetadataPath);
+    TSharedRef<FJsonObject> JsonObject = MakeShared<FJsonObject>();
+
+    JsonObject->SetNumberField(TEXT("SlotIndex"), SlotInfo.SlotIndex);
+    JsonObject->SetStringField(TEXT("SlotName"), SlotInfo.SlotName);
+    JsonObject->SetStringField(TEXT("PlayerName"), SlotInfo.PlayerName);
+    JsonObject->SetNumberField(TEXT("PlayerLevel"), SlotInfo.PlayerLevel);
+    JsonObject->SetNumberField(TEXT("TotalPlayTime"), SlotInfo.TotalPlayTime);
+    JsonObject->SetStringField(TEXT("SaveDate"), SlotInfo.SaveDate.ToIso8601());
+    JsonObject->SetBoolField(TEXT("IsValid"), SlotInfo.bIsValid);
+    JsonObject->SetBoolField(TEXT("IsAutosave"), SlotInfo.bIsAutosave);
+    JsonObject->SetNumberField(TEXT("FileSizeMB"), SlotInfo.FileSizeMB);
+    JsonObject->SetNumberField(TEXT("SaveDataVersion"), SlotInfo.SaveDataVersion);
+    JsonObject->SetNumberField(TEXT("Checksum"), static_cast<double>(SlotInfo.Checksum));
+
+    FString OutputString;
+    TSharedRef<TJsonWriter<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>> Writer = TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&OutputString);
+    if (!FJsonSerializer::Serialize(JsonObject, Writer))
+    {
+        return false;
+    }
+
+    return FFileHelper::SaveStringToFile(OutputString, *MetadataPath);
 }
 
 FHSSaveSlotInfo UHSSaveGameManager::LoadSlotMetadata(int32 SlotIndex) const
@@ -1143,18 +1404,76 @@ FHSSaveSlotInfo UHSSaveGameManager::LoadSlotMetadata(int32 SlotIndex) const
     
     FString MetadataPath = GetSlotFilePath(SlotIndex) + TEXT(".meta");
     FString MetadataJson;
-    
     if (FFileHelper::LoadFileToString(MetadataJson, *MetadataPath))
     {
-        // 간단한 JSON 파싱 (실제로는 JSON 라이브러리 사용)
-        // 현재는 기본값 사용
+        TSharedPtr<FJsonObject> JsonObject;
+        const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(MetadataJson);
+        if (FJsonSerializer::Deserialize(Reader, JsonObject) && JsonObject.IsValid())
+        {
+            FString Text;
+            double NumberValue = 0.0;
+            bool BoolValue = false;
+
+            if (JsonObject->TryGetStringField(TEXT("SlotName"), Text))
+            {
+                SlotInfo.SlotName = Text;
+            }
+
+            if (JsonObject->TryGetStringField(TEXT("PlayerName"), Text))
+            {
+                SlotInfo.PlayerName = Text;
+            }
+
+            if (JsonObject->TryGetNumberField(TEXT("PlayerLevel"), NumberValue))
+            {
+                SlotInfo.PlayerLevel = static_cast<int32>(NumberValue);
+            }
+
+            if (JsonObject->TryGetNumberField(TEXT("TotalPlayTime"), NumberValue))
+            {
+                SlotInfo.TotalPlayTime = static_cast<int32>(NumberValue);
+            }
+
+            if (JsonObject->TryGetStringField(TEXT("SaveDate"), Text))
+            {
+                FDateTime ParsedDate;
+                if (FDateTime::ParseIso8601(*Text, ParsedDate))
+                {
+                    SlotInfo.SaveDate = ParsedDate;
+                }
+            }
+
+            if (JsonObject->TryGetBoolField(TEXT("IsValid"), BoolValue))
+            {
+                SlotInfo.bIsValid = BoolValue;
+            }
+
+            if (JsonObject->TryGetBoolField(TEXT("IsAutosave"), BoolValue))
+            {
+                SlotInfo.bIsAutosave = BoolValue;
+            }
+
+            if (JsonObject->TryGetNumberField(TEXT("FileSizeMB"), NumberValue))
+            {
+                SlotInfo.FileSizeMB = static_cast<float>(NumberValue);
+            }
+
+            if (JsonObject->TryGetNumberField(TEXT("SaveDataVersion"), NumberValue))
+            {
+                SlotInfo.SaveDataVersion = static_cast<int32>(NumberValue);
+            }
+
+            if (JsonObject->TryGetNumberField(TEXT("Checksum"), NumberValue))
+            {
+                SlotInfo.Checksum = static_cast<uint32>(NumberValue);
+            }
+        }
     }
     
     // 파일 정보로 기본값 설정
     FString FilePath = GetSlotFilePath(SlotIndex);
     SlotInfo.SaveDate = GetFileModificationTime(FilePath);
     SlotInfo.FileSizeMB = GetFileSize(FilePath) / (1024.0f * 1024.0f);
-    SlotInfo.bIsValid = ValidateSaveFile(FilePath);
     
     return SlotInfo;
 }
@@ -1170,6 +1489,7 @@ void UHSSaveGameManager::UpdateSlotInfoCache() const
         if (DoesSaveSlotExist(i))
         {
             FHSSaveSlotInfo SlotInfo = LoadSlotMetadata(i);
+            SlotInfo.bIsValid = ValidateSaveFile(GetSlotFilePath(i));
             SlotInfoCache.Add(i, SlotInfo);
         }
     }

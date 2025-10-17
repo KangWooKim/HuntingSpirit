@@ -468,7 +468,6 @@ struct FHSSavePlayerProfile
 
 /**
  * 저장 게임 데이터 - 모든 플레이어 진행도 및 설정 관리
- * 현업 최적화: 버전 관리, 압축, 백업 시스템 내장
  */
 UCLASS(BlueprintType, Blueprintable)
 class HUNTINGSPIRIT_API UHSSaveGameData : public USaveGame

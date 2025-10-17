@@ -1,5 +1,5 @@
 // HSBossPhaseSystem.cpp
-// 보스 페이즈 시스템 구현 - 현업 최적화 기법 적용
+// 보스 페이즈 시스템 구현
 // 메모리 풀링, 오브젝트 풀링, 네트워크 복제 최적화, 프레임 분산 처리
 
 #include "HSBossPhaseSystem.h"

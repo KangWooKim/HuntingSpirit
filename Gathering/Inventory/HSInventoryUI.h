@@ -85,8 +85,7 @@ protected:
 
 /**
  * 인벤토리 UI 메인 위젯
- * 전체 인벤토리 인터페이스를 관리하는 UI 클래스
- * 현업 최적화: 가상화, 지연 로딩, 캐싱 시스템 적용
+ * 전체 인벤토리 인터페이스를 관리하며 가상화와 지연 로딩, 캐싱을 활용합니다
  */
 UCLASS(BlueprintType, Blueprintable)
 class HUNTINGSPIRIT_API UHSInventoryUI : public UUserWidget

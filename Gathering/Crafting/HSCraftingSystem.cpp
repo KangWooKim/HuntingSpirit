@@ -1,6 +1,7 @@
 #include "HSCraftingSystem.h"
 #include "../../Items/HSItemBase.h"
 #include "../Inventory/HSInventoryComponent.h"
+#include "HuntingSpirit/RoguelikeSystem/Progression/HSUnlockSystem.h"
 #include "Engine/World.h"
 #include "Engine/DataTable.h"
 #include "Engine/Engine.h"
@@ -9,6 +10,7 @@
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
 #include "HAL/PlatformFilemanager.h"
+#include "Templates/FunctionRef.h"
 
 UHSCraftingSystem::UHSCraftingSystem()
     : NextJobID(1)
@@ -253,12 +255,140 @@ bool UHSCraftingSystem::IsRecipeUnlocked(AActor* Crafter, const FHSCraftingRecip
         return false;
     }
 
-    // 기본적으로는 모든 레시피가 언락되어 있음
-    // 실제 게임에서는 더 복잡한 언락 조건 구현 필요
-    for (const FName& Condition : Recipe.UnlockConditions)
+    if (Recipe.UnlockConditions.Num() == 0)
     {
-        // 언락 조건 확인 로직 (예: 퀘스트 완료, 아이템 획득 등)
-        // 현재는 기본적으로 언락된 것으로 처리
+        return true;
+    }
+
+    UWorld* World = GetWorld();
+    UGameInstance* GameInstance = World ? World->GetGameInstance() : nullptr;
+    UHSUnlockSystem* UnlockSystem = GameInstance ? GameInstance->GetSubsystem<UHSUnlockSystem>() : nullptr;
+
+    const auto EvaluateSkillRequirement = [this, Crafter](const FString& Expression) -> bool
+    {
+        FString Normalized = Expression;
+        Normalized.TrimStartAndEndInline();
+
+        if (Normalized.IsEmpty())
+        {
+            return false;
+        }
+
+        auto EvaluateComparison = [this, Crafter](const FString& SkillNameString, const FString& LevelString, TFunctionRef<bool(int32, int32)> Comparator)
+        {
+            FString SkillName = SkillNameString;
+            FString LevelValue = LevelString;
+            SkillName.TrimStartAndEndInline();
+            LevelValue.TrimStartAndEndInline();
+
+            if (SkillName.IsEmpty() || LevelValue.IsEmpty())
+            {
+                return false;
+            }
+
+            const int32 RequiredLevel = FCString::Atoi(*LevelValue);
+            if (RequiredLevel <= 0)
+            {
+                return false;
+            }
+
+            const int32 CurrentLevel = GetCraftingSkillLevel(Crafter, FName(*SkillName));
+            return Comparator(CurrentLevel, RequiredLevel);
+        };
+
+        FString SkillName;
+        FString LevelString;
+
+        if (Normalized.Split(TEXT(">="), &SkillName, &LevelString))
+        {
+            return EvaluateComparison(SkillName, LevelString, [](int32 Current, int32 Required) { return Current >= Required; });
+        }
+
+        if (Normalized.Split(TEXT("<="), &SkillName, &LevelString))
+        {
+            return EvaluateComparison(SkillName, LevelString, [](int32 Current, int32 Required) { return Current <= Required; });
+        }
+
+        if (Normalized.Split(TEXT(">"), &SkillName, &LevelString))
+        {
+            return EvaluateComparison(SkillName, LevelString, [](int32 Current, int32 Required) { return Current > Required; });
+        }
+
+        if (Normalized.Split(TEXT("<"), &SkillName, &LevelString))
+        {
+            return EvaluateComparison(SkillName, LevelString, [](int32 Current, int32 Required) { return Current < Required; });
+        }
+
+        if (Normalized.Split(TEXT("="), &SkillName, &LevelString))
+        {
+            return EvaluateComparison(SkillName, LevelString, [](int32 Current, int32 Required) { return Current == Required; });
+        }
+
+        const int32 CurrentLevel = GetCraftingSkillLevel(Crafter, FName(*Normalized));
+        return CurrentLevel > 0;
+    };
+
+    for (const FName& ConditionName : Recipe.UnlockConditions)
+    {
+        if (ConditionName.IsNone())
+        {
+            continue;
+        }
+
+        const FString ConditionString = ConditionName.ToString();
+        bool bConditionMet = false;
+
+        if (UnlockSystem)
+        {
+            if (ConditionString.StartsWith(TEXT("Unlock:"), ESearchCase::IgnoreCase))
+            {
+                const FString UnlockID = ConditionString.Mid(7).TrimStartAndEnd();
+                bConditionMet = UnlockID.IsEmpty() || UnlockSystem->IsItemUnlocked(UnlockID);
+            }
+            else if (ConditionString.StartsWith(TEXT("CanUnlock:"), ESearchCase::IgnoreCase))
+            {
+                const FString UnlockID = ConditionString.Mid(10).TrimStartAndEnd();
+                bConditionMet = UnlockID.IsEmpty() || UnlockSystem->IsItemUnlocked(UnlockID) || UnlockSystem->CanUnlockItem(UnlockID);
+            }
+            else
+            {
+                bConditionMet = UnlockSystem->IsItemUnlocked(ConditionString);
+            }
+        }
+        else
+        {
+            UE_LOG(LogTemp, VeryVerbose, TEXT("HSCraftingSystem::IsRecipeUnlocked - Unlock system unavailable while evaluating condition %s"), *ConditionString);
+        }
+
+        if (!bConditionMet)
+        {
+            if (!UnlockSystem && (ConditionString.StartsWith(TEXT("Unlock:"), ESearchCase::IgnoreCase) || ConditionString.StartsWith(TEXT("CanUnlock:"), ESearchCase::IgnoreCase)))
+            {
+                bConditionMet = true;
+            }
+            else if (ConditionString.StartsWith(TEXT("Tag:"), ESearchCase::IgnoreCase))
+            {
+                const FString TagName = ConditionString.Mid(4).TrimStartAndEnd();
+                if (!TagName.IsEmpty())
+                {
+                    bConditionMet = Crafter->ActorHasTag(FName(*TagName));
+                }
+            }
+            else if (ConditionString.StartsWith(TEXT("Skill:"), ESearchCase::IgnoreCase))
+            {
+                const FString Requirement = ConditionString.Mid(6);
+                bConditionMet = EvaluateSkillRequirement(Requirement);
+            }
+            else
+            {
+                bConditionMet = EvaluateSkillRequirement(ConditionString);
+            }
+        }
+
+        if (!bConditionMet)
+        {
+            return false;
+        }
     }
 
     return true;

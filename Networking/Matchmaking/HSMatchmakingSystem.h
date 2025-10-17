@@ -250,7 +250,7 @@ protected:
     // 스레드 세이프 처리
     mutable FCriticalSection MatchmakingMutex;
     
-    // 현업 최적화: 메모리 풀링
+    // 메모리 풀링으로 할당 비용 감소
     TArray<FHSPlayerMatchmakingInfo> PlayerPool;
     TArray<FHSMatchInfo> MatchPool;
     

@@ -1,7 +1,5 @@
-// HuntingSpirit Game - Item Base Implementation
-// 모든 아이템의 기본 클래스 구현 (임시 구현 - 추후 확장 예정)
-
 #include "HSItemBase.h"
+#include "Components/SceneComponent.h"
 #include "Components/StaticMeshComponent.h"
 #include "Components/SphereComponent.h"
 #include "Particles/ParticleSystem.h"
@@ -125,24 +123,27 @@ void AHSItemBase::OnPickup(AActor* Picker)
 
     bIsPickedUp = true;
 
-    // 픽업 효과 재생
     if (PickupEffect)
     {
         UGameplayStatics::SpawnEmitterAtLocation(GetWorld(), PickupEffect, GetActorLocation());
     }
 
-    // 픽업 사운드 재생
     if (PickupSound)
     {
         UGameplayStatics::PlaySoundAtLocation(GetWorld(), PickupSound, GetActorLocation());
     }
 
-    // 물리 비활성화
     DisablePhysics();
 
-    // 아이템 숨기기 (인벤토리 시스템에서 처리)
     SetActorHiddenInGame(true);
     SetActorEnableCollision(false);
+    SetOwner(Picker);
+    bShouldRotate = false;
+
+    if (InteractionSphere)
+    {
+        InteractionSphere->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+    }
 
     UE_LOG(LogTemp, Log, TEXT("Item [%s] picked up by %s"), *ItemData.ItemName, *Picker->GetName());
 }
@@ -156,25 +157,35 @@ void AHSItemBase::OnDrop(AActor* Dropper)
     }
 
     bIsPickedUp = false;
+    SetOwner(nullptr);
 
-    // 드롭 위치 설정 (드롭하는 액터 앞쪽)
     FVector DropLocation = Dropper->GetActorLocation() + Dropper->GetActorForwardVector() * 100.0f;
     DropLocation.Z += 50.0f; // 약간 위로 올림
     SetActorLocation(DropLocation);
 
-    // 아이템 표시
     SetActorHiddenInGame(false);
     SetActorEnableCollision(true);
+    bShouldRotate = true;
 
-    // 물리 활성화
     if (bEnablePhysicsOnDrop)
     {
         EnablePhysics();
 
-        // 드롭 방향으로 힘 적용
         FVector DropDirection = Dropper->GetActorForwardVector() + FVector(0, 0, 0.5f);
         DropDirection.Normalize();
         ItemMeshComponent->AddImpulse(DropDirection * DropForce);
+    }
+    else if (ItemMeshComponent)
+    {
+        ItemMeshComponent->SetCollisionEnabled(ECollisionEnabled::QueryOnly);
+        ItemMeshComponent->SetCollisionResponseToAllChannels(ECR_Block);
+        ItemMeshComponent->SetCollisionResponseToChannel(ECC_Pawn, ECR_Ignore);
+        ItemMeshComponent->SetCollisionResponseToChannel(ECC_Camera, ECR_Ignore);
+    }
+
+    if (InteractionSphere)
+    {
+        InteractionSphere->SetCollisionEnabled(ECollisionEnabled::QueryOnly);
     }
 
     UE_LOG(LogTemp, Log, TEXT("Item [%s] dropped by %s"), *ItemData.ItemName, *Dropper->GetName());
@@ -188,24 +199,39 @@ void AHSItemBase::OnUse(AActor* User)
         return;
     }
 
-    // 기본 클래스에서는 로그만 출력
-    // 실제 사용 효과는 파생 클래스에서 구현
     UE_LOG(LogTemp, Log, TEXT("Item [%s] used by %s"), *ItemData.ItemName, *User->GetName());
+
+    const bool bIsConsumable = ItemData.ItemType == EHSItemType::Consumable;
+    if (bIsConsumable || ItemData.bCanStack)
+    {
+        const int32 NewQuantity = CurrentQuantity - 1;
+        SetItemQuantity(NewQuantity);
+    }
 }
 
 // 아이템 데이터 설정
 void AHSItemBase::SetItemData(const FHSItemData& NewData)
 {
     ItemData = NewData;
+    const int32 MaxStack = ItemData.bCanStack ? FMath::Max(1, ItemData.StackSize) : 1;
+    ItemData.StackSize = MaxStack;
+    if (CurrentQuantity <= 0)
+    {
+        CurrentQuantity = 0;
+    }
+    else
+    {
+        CurrentQuantity = FMath::Clamp(CurrentQuantity, 1, MaxStack);
+    }
     SetupItemMesh();
 }
 
 // 아이템 수량 설정
 void AHSItemBase::SetItemQuantity(int32 NewQuantity)
 {
-    CurrentQuantity = FMath::Max(0, NewQuantity);
+    const int32 MaxStack = ItemData.bCanStack ? FMath::Max(1, ItemData.StackSize) : 1;
+    CurrentQuantity = FMath::Clamp(NewQuantity, 0, MaxStack);
 
-    // 수량이 0이 되면 아이템 제거
     if (CurrentQuantity <= 0)
     {
         Destroy();
@@ -278,5 +304,4 @@ void AHSItemBase::OnInteractionSphereBeginOverlap(UPrimitiveComponent* Overlappe
 void AHSItemBase::OnInteractionSphereEndOverlap(UPrimitiveComponent* OverlappedComponent, 
     AActor* OtherActor, UPrimitiveComponent* OtherComp, int32 OtherBodyIndex)
 {
-    // 필요시 구현
 }

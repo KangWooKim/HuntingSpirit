@@ -1,5 +1,5 @@
 // 사냥의 영혼(HuntingSpirit) 게임의 성능 최적화 유틸리티 구현
-// 현업에서 사용하는 다양한 최적화 기법들의 구현
+// 다양한 최적화 기법들을 다룬다
 
 #include "HSPerformanceOptimizer.h"
 #include "Engine/Engine.h"
@@ -42,7 +42,7 @@ void FSIMDVectorOperations::CalculateDistancesBatch(
     
     for (int32 i = 0; i < SIMDCount; i += 4)
     {
-        // 현업 팁: 벡터화 가능한 루프로 작성하여 컴파일러 최적화 유도
+        // 루프를 벡터화할 수 있도록 4개씩 묶어서 처리
         const FVector* SourcePtr = &SourcePositions[i];
         float* DistancePtr = &OutDistances[i];
 
@@ -71,7 +71,7 @@ void FSIMDVectorOperations::NormalizeVectorsBatch(TArray<FVector>& InOutVectors)
         FVector& Vector = InOutVectors[Index];
         const float Length = Vector.Size();
         
-        // 현업 팁: 제로 디비전 방지
+        // 제로 디비전을 피하기 위한 보호 코드
         if (Length > SMALL_NUMBER)
         {
             const float InvLength = 1.0f / Length;
@@ -105,7 +105,7 @@ void FSIMDVectorOperations::DotProductBatch(
 
 void FCompressedPlayerData::CompressFromVector(const FVector& Position)
 {
-    // 현업 기법: 월드 좌표를 상대 좌표로 변환 후 압축
+    // 월드 좌표를 압축 범위로 변환하여 정밀도와 메모리를 균형 맞춘다
     // 일반적으로 -32768 ~ 32767 범위를 -1000 ~ 1000 월드 단위로 매핑
     constexpr float CompressionScale = 32.767f; // 1000 / 32767
     
@@ -127,78 +127,82 @@ FVector FCompressedPlayerData::DecompressToVector() const
 
 void FCompressedPlayerData::CompressFromRotator(const FRotator& Rotation)
 {
-    // 쿼터니언으로 변환 후 압축 (4바이트에 회전 정보 저장)
     FQuat Quat = Rotation.Quaternion();
-    
-    // 가장 큰 컴포넌트를 찾고 나머지 3개만 저장하는 압축 기법
-    int32 LargestIndex = 0;
-    float LargestValue = FMath::Abs(Quat.X);
-    
-    if (FMath::Abs(Quat.Y) > LargestValue)
+    if (!Quat.IsNormalized())
     {
-        LargestIndex = 1;
-        LargestValue = FMath::Abs(Quat.Y);
-    }
-    if (FMath::Abs(Quat.Z) > LargestValue)
-    {
-        LargestIndex = 2;
-        LargestValue = FMath::Abs(Quat.Z);
-    }
-    if (FMath::Abs(Quat.W) > LargestValue)
-    {
-        LargestIndex = 3;
+        Quat.Normalize();
     }
 
-    // 압축된 형태로 저장 (2비트 인덱스 + 30비트 데이터)
+    float Components[4] = {static_cast<float>(Quat.X), static_cast<float>(Quat.Y),
+                           static_cast<float>(Quat.Z), static_cast<float>(Quat.W)};
+
+    int32 LargestIndex = 0;
+    float MaxAbsValue = FMath::Abs(Components[0]);
+    for (int32 i = 1; i < 4; ++i)
+    {
+        const float AbsValue = FMath::Abs(Components[i]);
+        if (AbsValue > MaxAbsValue)
+        {
+            MaxAbsValue = AbsValue;
+            LargestIndex = i;
+        }
+    }
+
+    if (Components[LargestIndex] < 0.0f)
+    {
+        for (float& Component : Components)
+        {
+            Component = -Component;
+        }
+    }
+
     CompressedRotation = static_cast<uint32>(LargestIndex) << 30;
-    
-    // 나머지 3개 컴포넌트를 10비트씩 압축
-    float QuatComponents[4] = { static_cast<float>(Quat.X), static_cast<float>(Quat.Y), 
-                                static_cast<float>(Quat.Z), static_cast<float>(Quat.W) };
+
     int32 BitOffset = 20;
     for (int32 i = 0; i < 4; ++i)
     {
-        if (i != LargestIndex)
+        if (i == LargestIndex)
         {
-            uint32 CompressedComponent = static_cast<uint32>((QuatComponents[i] + 1.0f) * 511.5f);
-            CompressedRotation |= (CompressedComponent & 0x3FF) << BitOffset;
-            BitOffset -= 10;
+            continue;
         }
+
+        const float ClampedValue = FMath::Clamp(Components[i], -1.0f, 1.0f);
+        const uint32 Quantized = static_cast<uint32>(FMath::RoundToInt((ClampedValue + 1.0f) * 511.5f)) & 0x3FF;
+        CompressedRotation |= Quantized << BitOffset;
+        BitOffset -= 10;
     }
 }
 
 FRotator FCompressedPlayerData::DecompressToRotator() const
 {
-    // 압축 해제 과정
     const int32 LargestIndex = (CompressedRotation >> 30) & 0x3;
-    
-    // 직접 컴포넌트 값 복원
-    float QuatComponents[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
-    
-    // 3개 컴포넌트 복원
+
+    float Components[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
     int32 BitOffset = 20;
     float SumOfSquares = 0.0f;
-    
     for (int32 i = 0; i < 4; ++i)
     {
-        if (i != LargestIndex)
+        if (i == LargestIndex)
         {
-            uint32 CompressedComponent = (CompressedRotation >> BitOffset) & 0x3FF;
-            QuatComponents[i] = (static_cast<float>(CompressedComponent) / 511.5f) - 1.0f;
-            SumOfSquares += QuatComponents[i] * QuatComponents[i];
-            BitOffset -= 10;
+            continue;
         }
+
+        const uint32 QuantizedComponent = (CompressedRotation >> BitOffset) & 0x3FF;
+        const float Value = (static_cast<float>(QuantizedComponent) / 511.5f) - 1.0f;
+        Components[i] = Value;
+        SumOfSquares += Value * Value;
+        BitOffset -= 10;
     }
-    
-    // 가장 큰 컴포넌트 복원
-    QuatComponents[LargestIndex] = FMath::Sqrt(FMath::Max(0.0f, 1.0f - SumOfSquares));
-    if ((CompressedRotation >> (30 - LargestIndex)) & 1)
+
+    SumOfSquares = FMath::Min(SumOfSquares, 1.0f);
+    Components[LargestIndex] = FMath::Sqrt(FMath::Max(0.0f, 1.0f - SumOfSquares));
+
+    FQuat Quat(Components[0], Components[1], Components[2], Components[3]);
+    if (!Quat.IsNormalized())
     {
-        QuatComponents[LargestIndex] = -QuatComponents[LargestIndex];
+        Quat.Normalize();
     }
-    
-    // FQuat 생성 후 Rotator로 변환
-    FQuat Quat(QuatComponents[0], QuatComponents[1], QuatComponents[2], QuatComponents[3]);
     return Quat.Rotator();
 }
 
@@ -230,7 +234,7 @@ void FCacheOptimizedPlayerArray::RemovePlayerAtIndex(int32 Index)
 {
     if (Index >= 0 && Index < GetPlayerCount())
     {
-        // 현업 기법: 스왑-앤-팝으로 O(1) 제거
+        // 스왑-앤-팝으로 O(1) 시간에 제거
         const int32 LastIndex = GetPlayerCount() - 1;
         
         if (Index != LastIndex)
@@ -281,7 +285,7 @@ int32 FHighPerformanceObjectPool::AllocateIndex()
 {
     if (FreeIndices.Num() > 0)
     {
-        // 현업 기법: 프리 리스트에서 O(1) 할당
+        // 프리 리스트를 활용해 O(1) 시간에 할당
         const int32 Index = FreeIndices.Pop();
         ActiveFlags[Index] = true;
         return Index;
@@ -351,7 +355,7 @@ UHSPerformanceOptimizer::UHSPerformanceOptimizer()
 
 int32 UHSPerformanceOptimizer::GetOptimalStructAlignment(int32 StructSize)
 {
-    // 현업 기법: 2의 거듭제곱으로 정렬하여 캐시 라인 효율성 확보
+    // 2의 거듭제곱 정렬로 캐시 라인 효율을 확보
     if (StructSize <= 8) return 8;
     if (StructSize <= 16) return 16;
     if (StructSize <= 32) return 32;
@@ -361,7 +365,7 @@ int32 UHSPerformanceOptimizer::GetOptimalStructAlignment(int32 StructSize)
 
 void UHSPerformanceOptimizer::PreallocateMemoryPools(int32 ExpectedObjectCount)
 {
-    // 현업 기법: 런타임 할당 최소화를 위한 사전 메모리 예약
+    // 런타임 할당을 줄이기 위해 메모리를 미리 예약한다
     const int32 PoolSize = FMath::RoundUpToPowerOfTwo(ExpectedObjectCount * 2); // 버퍼 여유 확보
     
     // 각 타입별 풀 초기화
@@ -375,7 +379,7 @@ void UHSPerformanceOptimizer::PreallocateMemoryPools(int32 ExpectedObjectCount)
 
 void UHSPerformanceOptimizer::PrefetchMemory(const void* Address)
 {
-    // 현업 기법: CPU 캐시 프리페치로 메모리 접근 지연 숨기기
+    // CPU 캐시 프리페치로 메모리 접근 지연을 줄인다
 #if PLATFORM_WINDOWS && defined(_MSC_VER)
     _mm_prefetch(static_cast<const char*>(Address), _MM_HINT_T0);
 #elif defined(__GNUC__)
@@ -392,7 +396,7 @@ void UHSPerformanceOptimizer::ProcessPlayerUpdatesBatch(
     const int32 Count = FMath::Min(Positions.Num(), Velocities.Num());
     OutNewPositions.SetNumUninitialized(Count);
     
-    // 현업 기법: 배치 처리로 함수 호출 오버헤드 최소화
+    // 배치 처리로 함수 호출 오버헤드를 최소화
     for (int32 i = 0; i < Count; ++i)
     {
         OutNewPositions[i] = Positions[i] + Velocities[i] * DeltaTime;
@@ -408,7 +412,7 @@ void UHSPerformanceOptimizer::ProcessPlayerUpdatesParallel(
     const int32 Count = FMath::Min(Positions.Num(), Velocities.Num());
     OutNewPositions.SetNumUninitialized(Count);
     
-    // 현업 기법: 멀티스레드 병렬 처리로 성능 극대화
+    // 멀티스레드 병렬 처리로 성능을 높인다
     ParallelFor(Count, [&Positions, &Velocities, DeltaTime, &OutNewPositions](int32 Index)
     {
         OutNewPositions[Index] = Positions[Index] + Velocities[Index] * DeltaTime;
@@ -424,7 +428,7 @@ TArray<uint8> UHSPerformanceOptimizer::CompressDeltaData(
     
     DeltaData.Reserve(Count / 2); // 평균적으로 50% 압축률 예상
     
-    // 현업 기법: XOR 델타 인코딩으로 네트워크 대역폭 절약
+    // XOR 델타 인코딩으로 네트워크 대역폭을 절약
     for (int32 i = 0; i < Count; ++i)
     {
         const uint8 Delta = CurrentData[i] ^ PreviousData[i];
@@ -444,7 +448,7 @@ uint32 UHSPerformanceOptimizer::PackBoolArrayToBits(const TArray<bool>& BoolArra
     uint32 PackedBits = 0;
     const int32 Count = FMath::Min(BoolArray.Num(), 32);
     
-    // 현업 기법: 비트 패킹으로 메모리 및 네트워크 효율성 향상
+    // 비트 패킹으로 메모리와 네트워크 효율을 높인다
     for (int32 i = 0; i < Count; ++i)
     {
         if (BoolArray[i])
@@ -492,7 +496,7 @@ float UHSPerformanceOptimizer::EndPerformanceCounter(const FString& CounterName)
 
 void UHSPerformanceOptimizer::LogMemoryUsage()
 {
-    // 현업 기법: 메모리 사용량 모니터링으로 최적화 포인트 식별
+    // 메모리 사용량을 기록해 최적화 포인트를 식별한다
     const FPlatformMemoryStats MemStats = FPlatformMemory::GetStats();
     
     UE_LOG(LogHSPerformance, Log, TEXT("=== 메모리 사용량 현황 ==="));

@@ -1,7 +1,3 @@
-// HuntingSpirit Game - Item Base Header
-// 모든 아이템의 기본 클래스 (임시 구현 - 추후 확장 예정)
-// 아이템 시스템의 기초를 제공하는 클래스
-
 #pragma once
 
 #include "CoreMinimal.h"

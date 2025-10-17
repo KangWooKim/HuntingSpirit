@@ -353,7 +353,6 @@ struct FHSMonitoringConfig
 
 /**
  * 서버 설정 관리자 - 환경별 서버 구성 및 실시간 업데이트
- * 현업 최적화: 환경별 설정, 검증 시스템, 핫 리로드
  */
 UCLASS(BlueprintType, Blueprintable)
 class HUNTINGSPIRIT_API UHSServerConfig : public UDataAsset
