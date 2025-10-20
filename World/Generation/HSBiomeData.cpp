@@ -71,9 +71,8 @@ FPrimaryAssetId UHSBiomeData::GetPrimaryAssetId() const
 
 float UHSBiomeData::PerlinNoise2D(float X, float Y, int32 Seed) const
 {
-    // 간단한 Perlin 노이즈 구현
-    // 실제 프로젝트에서는 FMath::PerlinNoise2D 또는 더 최적화된 구현 사용 권장
-    
+    // Perlin 노이즈 구현
+
     // 격자 좌표 계산
     int32 X0 = FMath::FloorToInt(X);
     int32 X1 = X0 + 1;

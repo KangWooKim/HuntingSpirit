@@ -1,6 +1,5 @@
 // HSRuntimeNavigation.cpp
 // 런타임 네비게이션 관리자 구현
-// 현업 최적화 기법: 우선순위 큐, 성능 모니터링, 자동 복구 시스템
 
 #include "HSRuntimeNavigation.h"
 #include "NavigationSystem.h"
@@ -701,35 +700,26 @@ void UHSRuntimeNavigation::DetectAndRecoverStuckAIs()
 void UHSRuntimeNavigation::UpdatePerformanceStats()
 {
     FScopeLock Lock(&PerformanceStatsCriticalSection);
-    
-    // 평균 패스파인딩 시간 계산 (임시값, 실제로는 측정된 시간 사용)
-    if (PerformanceStats.SuccessfulRequests > 0)
-    {
-        PerformanceStats.AveragePathfindingTimeMs = 
-            (PerformanceStats.AveragePathfindingTimeMs + 50.0f) / 2.0f; // 임시 계산식
-    }
-    
+
     // 네비게이션 메시 커버리지 계산
     if (NavigationSystem.IsValid())
     {
-        // 간단한 샘플링을 통한 커버리지 추정
         UWorld* World = GetWorld();
         if (World)
         {
-            // UE5에서는 월드 바운드를 다르게 얻어옵니다
             FVector WorldOrigin = FVector::ZeroVector;
-            FVector WorldExtent = FVector(10000.0f, 10000.0f, 1000.0f); // 기본 월드 크기
+            FVector WorldExtent = FVector(10000.0f, 10000.0f, 1000.0f);
             FBox WorldBounds = FBox(WorldOrigin - WorldExtent, WorldOrigin + WorldExtent);
             float Coverage = EvaluateNavigationQuality(WorldBounds);
             PerformanceStats.NavMeshCoverage = Coverage;
         }
     }
-    
+
     if (bEnableDebugLogging)
     {
         UE_LOG(LogTemp, Log, TEXT("HSRuntimeNavigation: 성능 통계 업데이트 완료. 성공: %d, 실패: %d, 대기: %d, 평균 시간: %.1fms, 커버리지: %.2f"),
-               PerformanceStats.SuccessfulRequests, PerformanceStats.FailedRequests, 
-               PerformanceStats.PendingRequests, PerformanceStats.AveragePathfindingTimeMs, 
+               PerformanceStats.SuccessfulRequests, PerformanceStats.FailedRequests,
+               PerformanceStats.PendingRequests, PerformanceStats.AveragePathfindingTimeMs,
                PerformanceStats.NavMeshCoverage);
     }
 }
@@ -740,16 +730,25 @@ bool UHSRuntimeNavigation::ProcessPathfindingRequest(const FHSNavigationRequest&
     {
         return false;
     }
-    
+
     AAIController* AIController = Request.RequesterController.Get();
-    
-    // 패스파인딩 수행
+
+    const double StartTime = FPlatformTime::Seconds();
     UNavigationPath* Path = NavigationSystem->FindPathToLocationSynchronously(
         GetWorld(), Request.StartLocation, Request.TargetLocation);
-    
+    const double ElapsedTimeMs = (FPlatformTime::Seconds() - StartTime) * 1000.0;
+
     bool bSuccess = (Path && Path->IsValid());
-    
-    // AI 상태 업데이트
+
+    {
+        FScopeLock Lock(&PerformanceStatsCriticalSection);
+        if (bSuccess)
+        {
+            const float NewAverage = (PerformanceStats.AveragePathfindingTimeMs * PerformanceStats.SuccessfulRequests + ElapsedTimeMs) / (PerformanceStats.SuccessfulRequests + 1);
+            PerformanceStats.AveragePathfindingTimeMs = NewAverage;
+        }
+    }
+
     {
         FScopeLock Lock(&AIRegistryCriticalSection);
         if (FHSAINavigationInfo* AIInfo = RegisteredAIs.Find(AIController))
@@ -759,8 +758,7 @@ bool UHSRuntimeNavigation::ProcessPathfindingRequest(const FHSNavigationRequest&
                 AIInfo->CurrentState = EHSAINavigationState::Moving;
                 AIInfo->LastSuccessfulPathTime = FPlatformTime::Seconds();
                 AIInfo->ConsecutiveFailures = 0;
-                
-                // AI에게 이동 명령
+
                 AIController->MoveToLocation(Request.TargetLocation);
             }
             else
@@ -770,19 +768,18 @@ bool UHSRuntimeNavigation::ProcessPathfindingRequest(const FHSNavigationRequest&
             }
         }
     }
-    
+
     if (bEnableDebugLogging)
     {
-        UE_LOG(LogTemp, Log, TEXT("HSRuntimeNavigation: 패스파인딩 요청 처리 완료. AI: %s, 성공: %s"),
-               *AIController->GetName(), bSuccess ? TEXT("예") : TEXT("아니오"));
+        UE_LOG(LogTemp, Log, TEXT("HSRuntimeNavigation: 패스파인딩 요청 처리 완료. AI: %s, 성공: %s, 소요 시간: %.2fms"),
+               *AIController->GetName(), bSuccess ? TEXT("예") : TEXT("아니오"), ElapsedTimeMs);
     }
-    
-    // 디버그 시각화
+
     if (bEnableDebugVisualization && bSuccess)
     {
-        DrawDebugLine(GetWorld(), Request.StartLocation, Request.TargetLocation, 
+        DrawDebugLine(GetWorld(), Request.StartLocation, Request.TargetLocation,
                      FColor::Green, false, 3.0f, 0, 2.0f);
     }
-    
+
     return bSuccess;
 }

@@ -10,6 +10,8 @@
 class UProceduralMeshComponent;
 class HSProceduralMeshGenerator;
 class UInstancedStaticMeshComponent;
+class AHSObjectPool;
+class AHSResourceNode;
 
 /**
  * 청크 데이터 구조체
@@ -180,6 +182,19 @@ private:
     // 성능 최적화를 위한 오브젝트 풀링 처리
     void HandleObjectPooling();
     
+    // HeightMap 및 좌표 계산 헬퍼
+    int32 GetHeightMapSize() const;
+    bool TryGetHeightAtMapCoordinate(int32 X, int32 Y, float& OutHeight) const;
+    FVector CalculateLocalLocation(int32 X, int32 Y, float Height) const;
+    float CalculateSlopeDegrees(int32 X, int32 Y) const;
+    
+    // 인스턴스드 메시 헬퍼
+    UInstancedStaticMeshComponent* GetOrCreateInstancedComponent(const FString& Key);
+    void ConfigureInstanceComponentLOD(UInstancedStaticMeshComponent* Component) const;
+    
+    // 리소스 노드 풀 관리
+    void EnsureResourceNodePool();
+    
     // 오브젝트 배치 헬퍼 함수들
     void SpawnTreesInChunk();
     void SpawnRocksInChunk();
@@ -191,4 +206,11 @@ private:
     void SpawnResourceNodesInChunk();
     void SetupEnemySpawnPoints();
     void UpdateObjectVisibilityForLOD();
+    
+    // 풀에서 사용 중인 리소스 노드 추적
+    UPROPERTY()
+    TSet<TWeakObjectPtr<AActor>> ActiveResourceNodes;
+    
+    UPROPERTY()
+    TWeakObjectPtr<AHSObjectPool> ResourceNodePool;
 };

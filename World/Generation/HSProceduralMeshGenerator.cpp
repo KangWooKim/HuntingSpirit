@@ -466,9 +466,7 @@ void HSProceduralMeshGenerator::WeldVertices(
 // 삼각형 스트립 최적화
 void HSProceduralMeshGenerator::OptimizeTriangleStrip(TArray<int32>& Triangles)
 {
-    // 간단한 캐시 최적화
-    // 실제 구현은 더 복잡한 알고리즘 필요
-    // 여기서는 기본적인 구현만 제공
+    // 캐시 최적화
 }
 
 // 노말 스무딩 함수

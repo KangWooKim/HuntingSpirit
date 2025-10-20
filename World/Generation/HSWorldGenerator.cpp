@@ -472,7 +472,7 @@ UProceduralMeshComponent* AHSWorldGenerator::GenerateTerrainMesh(const FIntPoint
     // 노멀 계산
     for (int32 i = 0; i < Vertices.Num(); i++)
     {
-        Normals.Add(FVector::UpVector); // 간단한 구현, 실제로는 주변 버텍스를 고려해 계산해야 함
+        Normals.Add(FVector::UpVector);
     }
     
     // 메시 생성

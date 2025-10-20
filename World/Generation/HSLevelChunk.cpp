@@ -7,6 +7,9 @@
 #include "GameFramework/PlayerController.h"
 #include "Kismet/GameplayStatics.h"
 #include "Engine/Engine.h"
+#include "Engine/TargetPoint.h"
+#include "EngineUtils.h"
+#include "../Resources/HSResourceNode.h"
 #include "../../Optimization/ObjectPool/HSObjectPool.h"
 
 // 생성자
@@ -306,16 +309,48 @@ void AHSLevelChunk::CleanupChunk()
     }
     InstancedMeshComponents.Empty();
     
-    // 스폰된 액터들을 오브젝트 풀로 반환
-    for (AActor* Actor : SpawnedActors)
+    // 스폰된 액터 정리
+    auto ReturnOrDestroyResourceNode = [this](AActor* Actor)
     {
-        if (Actor)
+        if (!Actor)
         {
-            // 오브젝트 풀로 반환 (구현 필요)
+            return;
+        }
+
+        if (ResourceNodePool.IsValid())
+        {
+            ResourceNodePool->ReturnObjectToPool(Actor);
+        }
+        else
+        {
             Actor->Destroy();
         }
+    };
+
+    for (AActor*& Actor : SpawnedActors)
+    {
+        if (!Actor)
+        {
+            continue;
+        }
+
+        if (Actor->IsA(AHSResourceNode::StaticClass()))
+        {
+            const TWeakObjectPtr<AActor> ActorPtr(Actor);
+            if (ActiveResourceNodes.Contains(ActorPtr))
+            {
+                ReturnOrDestroyResourceNode(Actor);
+            }
+        }
+        else
+        {
+            Actor->Destroy();
+        }
+
+        Actor = nullptr;
     }
     SpawnedActors.Empty();
+    ActiveResourceNodes.Empty();
     
     // 인접 청크 참조 클리어
     NeighborChunks.Empty();
@@ -340,8 +375,7 @@ void AHSLevelChunk::BlendChunkBorders()
         AHSLevelChunk* NeighborChunk = Pair.Value;
         if (NeighborChunk && NeighborChunk->IsChunkLoaded())
         {
-            // 경계 정점들의 높이 값 블렌딩 (구현 상세 필요)
-            // 이는 메시 생성기에서 처리하도록 위임
+            // 경계 정점들의 높이 값을 혼합해 이음새를 최소화하도록 메시 생성기에 위임
             if (MeshGenerator)
             {
                 MeshGenerator->BlendBorderVertices(
@@ -357,61 +391,620 @@ void AHSLevelChunk::BlendChunkBorders()
 // 성능 최적화를 위한 오브젝트 풀링 처리
 void AHSLevelChunk::HandleObjectPooling()
 {
-    // 오브젝트 풀 매니저 가져오기 (구현 필요)
-    // 청크 로드 시 필요한 오브젝트들을 풀에서 가져와 배치
-    // 청크 언로드 시 오브젝트들을 풀로 반환
+    EnsureResourceNodePool();
+}
+
+void AHSLevelChunk::EnsureResourceNodePool()
+{
+    if (ResourceNodePool.IsValid())
+    {
+        return;
+    }
+
+    UWorld* World = GetWorld();
+    if (!World)
+    {
+        return;
+    }
+
+    for (TActorIterator<AHSObjectPool> It(World); It; ++It)
+    {
+        AHSObjectPool* Pool = *It;
+        if (Pool && Pool->GetPoolClass() == AHSResourceNode::StaticClass())
+        {
+            ResourceNodePool = Pool;
+            return;
+        }
+    }
+
+    FActorSpawnParameters SpawnParams;
+    SpawnParams.Owner = this;
+    SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+
+    if (AHSObjectPool* NewPool = World->SpawnActor<AHSObjectPool>(AHSObjectPool::StaticClass(), GetActorLocation(), FRotator::ZeroRotator, SpawnParams))
+    {
+        NewPool->InitializePool(AHSResourceNode::StaticClass(), 12, World);
+        ResourceNodePool = NewPool;
+    }
+}
+
+int32 AHSLevelChunk::GetHeightMapSize() const
+{
+    const int32 NumValues = ChunkData.HeightMap.Num();
+    if (NumValues == 0)
+    {
+        return 0;
+    }
+
+    const int32 MapSize = FMath::RoundToInt(FMath::Sqrt(static_cast<float>(NumValues)));
+    return (MapSize * MapSize == NumValues) ? MapSize : 0;
+}
+
+bool AHSLevelChunk::TryGetHeightAtMapCoordinate(int32 X, int32 Y, float& OutHeight) const
+{
+    const int32 MapSize = GetHeightMapSize();
+    if (MapSize < 2)
+    {
+        return false;
+    }
+
+    if (X < 0 || Y < 0 || X >= MapSize || Y >= MapSize)
+    {
+        return false;
+    }
+
+    const int32 Index = Y * MapSize + X;
+    if (!ChunkData.HeightMap.IsValidIndex(Index))
+    {
+        return false;
+    }
+
+    OutHeight = ChunkData.HeightMap[Index];
+    return true;
+}
+
+FVector AHSLevelChunk::CalculateLocalLocation(int32 X, int32 Y, float Height) const
+{
+    const int32 MapSize = GetHeightMapSize();
+    if (MapSize < 2)
+    {
+        return FVector::ZeroVector;
+    }
+
+    const float CellSize = ChunkData.ChunkSize / (MapSize - 1);
+    return FVector(
+        X * CellSize - ChunkData.ChunkSize * 0.5f,
+        Y * CellSize - ChunkData.ChunkSize * 0.5f,
+        Height
+    );
+}
+
+float AHSLevelChunk::CalculateSlopeDegrees(int32 X, int32 Y) const
+{
+    const int32 MapSize = GetHeightMapSize();
+    if (MapSize < 2 || !MeshGenerator)
+    {
+        return 0.0f;
+    }
+
+    const float CellSize = ChunkData.ChunkSize / (MapSize - 1);
+    const FVector Normal = MeshGenerator->CalculateNormalFromHeightMap(ChunkData.HeightMap, X, Y, MapSize, CellSize).GetSafeNormal();
+    const float Dot = FMath::Clamp(FVector::DotProduct(Normal, FVector::UpVector), -1.0f, 1.0f);
+    return FMath::RadiansToDegrees(FMath::Acos(Dot));
+}
+
+UInstancedStaticMeshComponent* AHSLevelChunk::GetOrCreateInstancedComponent(const FString& Key)
+{
+    if (UInstancedStaticMeshComponent** FoundComponent = InstancedMeshComponents.Find(Key))
+    {
+        if (FoundComponent && *FoundComponent)
+        {
+            return *FoundComponent;
+        }
+    }
+
+    UInstancedStaticMeshComponent* NewComponent = NewObject<UInstancedStaticMeshComponent>(this);
+    if (!NewComponent)
+    {
+        return nullptr;
+    }
+
+    NewComponent->SetupAttachment(RootComponent);
+    NewComponent->SetMobility(EComponentMobility::Movable);
+    NewComponent->RegisterComponent();
+    ConfigureInstanceComponentLOD(NewComponent);
+
+    InstancedMeshComponents.Add(Key, NewComponent);
+    return NewComponent;
+}
+
+void AHSLevelChunk::ConfigureInstanceComponentLOD(UInstancedStaticMeshComponent* Component) const
+{
+    if (!Component)
+    {
+        return;
+    }
+
+    const float EndCullDistance = ChunkLoadDistance * (1.0f + FMath::Clamp<float>(CurrentLODLevel, 0.0f, 3.0f));
+    Component->SetCullDistances(0.0f, EndCullDistance);
 }
 
 // 나무 배치 함수 (헬퍼 함수)
 void AHSLevelChunk::SpawnTreesInChunk()
 {
-    // 인스턴스드 메시 컴포넌트 생성 또는 가져오기
-    UInstancedStaticMeshComponent* TreeInstances = nullptr;
-    if (!InstancedMeshComponents.Contains("Trees"))
+    UInstancedStaticMeshComponent* TreeInstances = GetOrCreateInstancedComponent(TEXT("Trees"));
+    if (!TreeInstances)
     {
-        TreeInstances = NewObject<UInstancedStaticMeshComponent>(this);
-        TreeInstances->SetupAttachment(RootComponent);
-        TreeInstances->RegisterComponent();
-        InstancedMeshComponents.Add("Trees", TreeInstances);
+        return;
     }
-    else
+
+    const int32 MapSize = GetHeightMapSize();
+    if (MapSize < 2)
     {
-        TreeInstances = InstancedMeshComponents["Trees"];
+        return;
     }
-    
-    // 나무 메시 설정 (에디터에서 설정하거나 코드로 로드)
-    // TreeInstances->SetStaticMesh(TreeMesh);
-    
-    // 밀도에 따른 나무 배치
-    int32 TreeCount = FMath::RandRange(10, 50) * ObjectDensity;
-    for (int32 i = 0; i < TreeCount; i++)
+
+    const float NormalizedDensity = FMath::Clamp(ObjectDensity, 0.05f, 1.0f);
+    const int32 Step = FMath::Clamp(FMath::RoundToInt(6.0f / NormalizedDensity), 1, MapSize - 1);
+
+    for (int32 Y = Step / 2; Y < MapSize; Y += Step)
     {
-        FVector RandomLocation = FVector(
-            FMath::RandRange(-ChunkData.ChunkSize * 0.5f, ChunkData.ChunkSize * 0.5f),
-            FMath::RandRange(-ChunkData.ChunkSize * 0.5f, ChunkData.ChunkSize * 0.5f),
-            0.0f
-        );
-        
-        // 높이 맵에서 Z 좌표 가져오기
-        // RandomLocation.Z = GetHeightAtLocation(RandomLocation);
-        
-        FTransform TreeTransform(
-            FRotator(0, FMath::RandRange(0, 360), 0),
-            RandomLocation,
-            FVector(FMath::RandRange(0.8f, 1.2f))
-        );
-        
-        TreeInstances->AddInstance(TreeTransform);
+        for (int32 X = Step / 2; X < MapSize; X += Step)
+        {
+            float Height = 0.0f;
+            if (!TryGetHeightAtMapCoordinate(X, Y, Height))
+            {
+                continue;
+            }
+
+            const float Slope = CalculateSlopeDegrees(X, Y);
+            if (Slope > 35.0f)
+            {
+                continue;
+            }
+
+            const FVector LocalLocation = CalculateLocalLocation(X, Y, Height);
+            const float Noise = FMath::PerlinNoise1D((X * 0.37f + Y * 0.23f) * 0.5f);
+            const float ScaleScalar = 0.9f + 0.2f * FMath::Clamp(Noise, -1.0f, 1.0f);
+            const float Yaw = FMath::Fmod(static_cast<float>(X * 17 + Y * 29), 360.0f);
+
+            TreeInstances->AddInstance(FTransform(
+                FRotator(0.0f, Yaw, 0.0f),
+                LocalLocation,
+                FVector(ScaleScalar)
+            ));
+        }
     }
 }
 
-// 기타 헬퍼 함수들 (구현 생략)
-void AHSLevelChunk::SpawnRocksInChunk() {}
-void AHSLevelChunk::SpawnGrassInChunk() {}
-void AHSLevelChunk::SpawnCactiInChunk() {}
-void AHSLevelChunk::SpawnDesertRocksInChunk() {}
-void AHSLevelChunk::SpawnSnowTreesInChunk() {}
-void AHSLevelChunk::SpawnIceCrystalsInChunk() {}
-void AHSLevelChunk::SpawnResourceNodesInChunk() {}
-void AHSLevelChunk::SetupEnemySpawnPoints() {}
-void AHSLevelChunk::UpdateObjectVisibilityForLOD() {}
+void AHSLevelChunk::SpawnRocksInChunk()
+{
+    UInstancedStaticMeshComponent* RockInstances = GetOrCreateInstancedComponent(TEXT("Rocks"));
+    if (!RockInstances)
+    {
+        return;
+    }
+
+    const int32 MapSize = GetHeightMapSize();
+    if (MapSize < 2)
+    {
+        return;
+    }
+
+    const float Density = FMath::Clamp(ObjectDensity * 0.6f + 0.2f, 0.1f, 1.0f);
+    const int32 Step = FMath::Clamp(FMath::RoundToInt(10.0f / Density), 1, MapSize - 1);
+
+    for (int32 Y = Step / 2; Y < MapSize; Y += Step)
+    {
+        for (int32 X = Step / 2; X < MapSize; X += Step)
+        {
+            float Height = 0.0f;
+            if (!TryGetHeightAtMapCoordinate(X, Y, Height))
+            {
+                continue;
+            }
+
+            const float Slope = CalculateSlopeDegrees(X, Y);
+            if (Slope < 12.0f || Slope > 55.0f)
+            {
+                continue;
+            }
+
+            if (((X + Y) & 1) != 0)
+            {
+                continue;
+            }
+
+            const FVector LocalLocation = CalculateLocalLocation(X, Y, Height);
+            const float Noise = FMath::PerlinNoise1D((X * 0.31f + Y * 0.47f) * 0.4f);
+            const float Scale = FMath::Lerp(0.8f, 1.2f, (Noise * 0.5f) + 0.5f);
+            const float Yaw = FMath::Fmod(static_cast<float>(X * 23 + Y * 41), 360.0f);
+
+            RockInstances->AddInstance(FTransform(
+                FRotator(0.0f, Yaw, 0.0f),
+                LocalLocation,
+                FVector(Scale)
+            ));
+        }
+    }
+}
+
+void AHSLevelChunk::SpawnGrassInChunk()
+{
+    UInstancedStaticMeshComponent* GrassInstances = GetOrCreateInstancedComponent(TEXT("Grass"));
+    if (!GrassInstances)
+    {
+        return;
+    }
+
+    const int32 MapSize = GetHeightMapSize();
+    if (MapSize < 2)
+    {
+        return;
+    }
+
+    const float Density = FMath::Clamp(ObjectDensity * 1.5f, 0.1f, 1.0f);
+    const int32 Step = FMath::Clamp(FMath::RoundToInt(4.0f / Density), 1, MapSize - 1);
+
+    for (int32 Y = Step / 2; Y < MapSize; Y += Step)
+    {
+        for (int32 X = Step / 2; X < MapSize; X += Step)
+        {
+            float Height = 0.0f;
+            if (!TryGetHeightAtMapCoordinate(X, Y, Height))
+            {
+                continue;
+            }
+
+            const float Slope = CalculateSlopeDegrees(X, Y);
+            if (Slope > 9.0f)
+            {
+                continue;
+            }
+
+            const FVector LocalLocation = CalculateLocalLocation(X, Y, Height);
+            const float Noise = FMath::PerlinNoise1D((X * 0.9f + Y * 0.4f) * 0.25f);
+            const float Scale = 0.75f + 0.25f * ((Noise * 0.5f) + 0.5f);
+            const float Yaw = FMath::Fmod(static_cast<float>(X * 13 + Y * 17), 360.0f);
+
+            GrassInstances->AddInstance(FTransform(
+                FRotator(0.0f, Yaw, 0.0f),
+                LocalLocation,
+                FVector(Scale)
+            ));
+        }
+    }
+}
+
+void AHSLevelChunk::SpawnCactiInChunk()
+{
+    UInstancedStaticMeshComponent* CactusInstances = GetOrCreateInstancedComponent(TEXT("Cacti"));
+    if (!CactusInstances)
+    {
+        return;
+    }
+
+    const int32 MapSize = GetHeightMapSize();
+    if (MapSize < 2)
+    {
+        return;
+    }
+
+    const int32 Step = FMath::Max(1, MapSize / 6);
+
+    for (int32 Y = Step / 2; Y < MapSize; Y += Step)
+    {
+        for (int32 X = Step / 2; X < MapSize; X += Step)
+        {
+            float Height = 0.0f;
+            if (!TryGetHeightAtMapCoordinate(X, Y, Height))
+            {
+                continue;
+            }
+
+            const float Slope = CalculateSlopeDegrees(X, Y);
+            if (Slope > 8.0f || ((X + Y) % 3) != 0)
+            {
+                continue;
+            }
+
+            const FVector LocalLocation = CalculateLocalLocation(X, Y, Height);
+            const float Noise = FMath::PerlinNoise1D((X * 0.2f + Y * 0.6f) * 0.3f);
+            const float Scale = 0.85f + 0.3f * ((Noise * 0.5f) + 0.5f);
+            const float Yaw = FMath::Fmod(static_cast<float>(X * 19 + Y * 11), 360.0f);
+
+            CactusInstances->AddInstance(FTransform(
+                FRotator(0.0f, Yaw, 0.0f),
+                LocalLocation,
+                FVector(Scale)
+            ));
+        }
+    }
+}
+
+void AHSLevelChunk::SpawnDesertRocksInChunk()
+{
+    UInstancedStaticMeshComponent* DesertRockInstances = GetOrCreateInstancedComponent(TEXT("DesertRocks"));
+    if (!DesertRockInstances)
+    {
+        return;
+    }
+
+    const int32 MapSize = GetHeightMapSize();
+    if (MapSize < 2)
+    {
+        return;
+    }
+
+    const int32 Step = FMath::Clamp(MapSize / 8, 1, MapSize - 1);
+
+    for (int32 Y = Step / 2; Y < MapSize; Y += Step)
+    {
+        for (int32 X = Step / 2; X < MapSize; X += Step)
+        {
+            float Height = 0.0f;
+            if (!TryGetHeightAtMapCoordinate(X, Y, Height))
+            {
+                continue;
+            }
+
+            const float Slope = CalculateSlopeDegrees(X, Y);
+            if (Slope < 6.0f || Slope > 32.0f)
+            {
+                continue;
+            }
+
+            const FVector LocalLocation = CalculateLocalLocation(X, Y, Height);
+            const float Noise = FMath::PerlinNoise1D((X * 0.44f + Y * 0.19f) * 0.35f);
+            const float Scale = 0.9f + 0.3f * FMath::Abs(Noise);
+            const float Yaw = FMath::Fmod(static_cast<float>(X * 31 + Y * 7), 360.0f);
+
+            DesertRockInstances->AddInstance(FTransform(
+                FRotator(0.0f, Yaw, 0.0f),
+                LocalLocation,
+                FVector(Scale)
+            ));
+        }
+    }
+}
+
+void AHSLevelChunk::SpawnSnowTreesInChunk()
+{
+    UInstancedStaticMeshComponent* SnowTreeInstances = GetOrCreateInstancedComponent(TEXT("SnowTrees"));
+    if (!SnowTreeInstances)
+    {
+        return;
+    }
+
+    const int32 MapSize = GetHeightMapSize();
+    if (MapSize < 2)
+    {
+        return;
+    }
+
+    const float Density = FMath::Clamp(ObjectDensity * 0.8f, 0.05f, 1.0f);
+    const int32 Step = FMath::Clamp(FMath::RoundToInt(7.0f / Density), 1, MapSize - 1);
+
+    for (int32 Y = Step / 2; Y < MapSize; Y += Step)
+    {
+        for (int32 X = Step / 2; X < MapSize; X += Step)
+        {
+            float Height = 0.0f;
+            if (!TryGetHeightAtMapCoordinate(X, Y, Height))
+            {
+                continue;
+            }
+
+            const float Slope = CalculateSlopeDegrees(X, Y);
+            if (Slope > 28.0f)
+            {
+                continue;
+            }
+
+            const FVector LocalLocation = CalculateLocalLocation(X, Y, Height);
+            const float Noise = FMath::PerlinNoise1D((X * 0.27f + Y * 0.52f) * 0.45f);
+            const float Scale = 0.95f + 0.15f * ((Noise * 0.5f) + 0.5f);
+            const float Yaw = FMath::Fmod(static_cast<float>(X * 21 + Y * 33), 360.0f);
+
+            SnowTreeInstances->AddInstance(FTransform(
+                FRotator(0.0f, Yaw, 0.0f),
+                LocalLocation,
+                FVector(Scale)
+            ));
+        }
+    }
+}
+
+void AHSLevelChunk::SpawnIceCrystalsInChunk()
+{
+    UInstancedStaticMeshComponent* IceCrystalInstances = GetOrCreateInstancedComponent(TEXT("IceCrystals"));
+    if (!IceCrystalInstances)
+    {
+        return;
+    }
+
+    const int32 MapSize = GetHeightMapSize();
+    if (MapSize < 2)
+    {
+        return;
+    }
+
+    const int32 Step = FMath::Clamp(MapSize / 10, 1, MapSize - 1);
+
+    for (int32 Y = Step / 2; Y < MapSize; Y += Step)
+    {
+        for (int32 X = Step / 2; X < MapSize; X += Step)
+        {
+            float Height = 0.0f;
+            if (!TryGetHeightAtMapCoordinate(X, Y, Height))
+            {
+                continue;
+            }
+
+            if (Height < 0.0f)
+            {
+                continue;
+            }
+
+            const FVector LocalLocation = CalculateLocalLocation(X, Y, Height);
+            const float Noise = FMath::PerlinNoise1D((X * 0.58f + Y * 0.14f) * 0.32f);
+            const float Scale = 0.7f + 0.4f * ((Noise * 0.5f) + 0.5f);
+            const float Pitch = FMath::Fmod(static_cast<float>(X * 9 + Y * 5), 45.0f) - 22.5f;
+            const float Yaw = FMath::Fmod(static_cast<float>(X * 17 + Y * 25), 360.0f);
+
+            IceCrystalInstances->AddInstance(FTransform(
+                FRotator(Pitch, Yaw, 0.0f),
+                LocalLocation,
+                FVector(Scale)
+            ));
+        }
+    }
+}
+
+void AHSLevelChunk::SpawnResourceNodesInChunk()
+{
+    const int32 MapSize = GetHeightMapSize();
+    if (MapSize < 2)
+    {
+        return;
+    }
+
+    EnsureResourceNodePool();
+
+    UWorld* World = GetWorld();
+    if (!World)
+    {
+        return;
+    }
+
+    const int32 Step = FMath::Max(1, MapSize / 5);
+
+    for (int32 Y = Step / 2; Y < MapSize; Y += Step)
+    {
+        for (int32 X = Step / 2; X < MapSize; X += Step)
+        {
+            float Height = 0.0f;
+            if (!TryGetHeightAtMapCoordinate(X, Y, Height))
+            {
+                continue;
+            }
+
+            const float Slope = CalculateSlopeDegrees(X, Y);
+            if (Slope > 20.0f)
+            {
+                continue;
+            }
+
+            const FVector LocalLocation = CalculateLocalLocation(X, Y, Height);
+            const FVector WorldLocation = GetActorLocation() + LocalLocation;
+
+            AActor* SpawnedNode = nullptr;
+            if (ResourceNodePool.IsValid())
+            {
+                SpawnedNode = ResourceNodePool->SpawnPooledObject(WorldLocation, FRotator::ZeroRotator);
+            }
+            else
+            {
+                FActorSpawnParameters SpawnParams;
+                SpawnParams.Owner = this;
+                SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AdjustIfPossibleButAlwaysSpawn;
+                SpawnedNode = World->SpawnActor<AHSResourceNode>(AHSResourceNode::StaticClass(), WorldLocation, FRotator::ZeroRotator, SpawnParams);
+            }
+
+            if (SpawnedNode)
+            {
+                SpawnedActors.Add(SpawnedNode);
+                ActiveResourceNodes.Add(TWeakObjectPtr<AActor>(SpawnedNode));
+            }
+        }
+    }
+}
+
+void AHSLevelChunk::SetupEnemySpawnPoints()
+{
+    UWorld* World = GetWorld();
+    if (!World)
+    {
+        return;
+    }
+
+    const int32 MapSize = GetHeightMapSize();
+    if (MapSize < 2)
+    {
+        return;
+    }
+
+    const TArray<FVector2D> NormalizedPoints = {
+        FVector2D(0.25f, 0.25f),
+        FVector2D(0.75f, 0.25f),
+        FVector2D(0.25f, 0.75f),
+        FVector2D(0.75f, 0.75f)
+    };
+
+    for (const FVector2D& Normalized : NormalizedPoints)
+    {
+        const int32 X = FMath::Clamp(FMath::RoundToInt(Normalized.X * (MapSize - 1)), 0, MapSize - 1);
+        const int32 Y = FMath::Clamp(FMath::RoundToInt(Normalized.Y * (MapSize - 1)), 0, MapSize - 1);
+
+        float Height = 0.0f;
+        if (!TryGetHeightAtMapCoordinate(X, Y, Height))
+        {
+            continue;
+        }
+
+        if (CalculateSlopeDegrees(X, Y) > 18.0f)
+        {
+            continue;
+        }
+
+        const FVector LocalLocation = CalculateLocalLocation(X, Y, Height + 50.0f);
+        const FVector WorldLocation = GetActorLocation() + LocalLocation;
+
+        FActorSpawnParameters SpawnParams;
+        SpawnParams.Owner = this;
+        SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+
+        if (ATargetPoint* SpawnPoint = World->SpawnActor<ATargetPoint>(WorldLocation, FRotator::ZeroRotator, SpawnParams))
+        {
+            SpawnedActors.Add(SpawnPoint);
+        }
+    }
+}
+
+void AHSLevelChunk::UpdateObjectVisibilityForLOD()
+{
+    const bool bShowFineDetails = CurrentLODLevel <= 1;
+    const bool bShowCoarseDetails = CurrentLODLevel <= 2;
+
+    for (auto& Pair : InstancedMeshComponents)
+    {
+        if (UInstancedStaticMeshComponent* Component = Pair.Value)
+        {
+            const bool bIsGrass = Pair.Key.Contains(TEXT("Grass"));
+            const bool bIsIceCrystal = Pair.Key.Contains(TEXT("Ice"));
+            const bool bVisible = bIsGrass ? bShowFineDetails : (bIsIceCrystal ? bShowCoarseDetails : true);
+
+            Component->SetVisibility(bVisible);
+            Component->SetComponentTickEnabled(bVisible);
+            ConfigureInstanceComponentLOD(Component);
+        }
+    }
+
+    for (const TWeakObjectPtr<AActor>& ResourceNodePtr : ActiveResourceNodes)
+    {
+        if (AActor* ResourceActor = ResourceNodePtr.Get())
+        {
+            ResourceActor->SetActorHiddenInGame(CurrentLODLevel > 2);
+        }
+    }
+
+    for (AActor* Actor : SpawnedActors)
+    {
+        if (!Actor || Actor->IsA(AHSResourceNode::StaticClass()))
+        {
+            continue;
+        }
+
+        Actor->SetActorHiddenInGame(CurrentLODLevel > 2);
+    }
+}

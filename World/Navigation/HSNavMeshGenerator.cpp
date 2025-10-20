@@ -1,7 +1,4 @@
 // HSNavMeshGenerator.cpp
-// 네비게이션 메시 동적 생성 구현
-// 현업 최적화 기법: 메모리 풀링, 공간 분할, 멀티스레딩, 품질 검증
-
 #include "HSNavMeshGenerator.h"
 #include "NavigationSystem.h"
 #include "NavMesh/RecastNavMesh.h"
