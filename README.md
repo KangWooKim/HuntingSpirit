@@ -2,7 +2,7 @@
 
 **협동 보스 사냥 로그라이크 RPG**
 
-![Development Status](https://img.shields.io/badge/Status-In%20Development%20(60%25)-brightgreen)
+![Development Status](https://img.shields.io/badge/Status-In%20Development%20(80%25)-brightgreen)
 ![Engine](https://img.shields.io/badge/Engine-Unreal%20Engine%205-blue)
 ![Platform](https://img.shields.io/badge/Platform-PC-green)
 ![Language](https://img.shields.io/badge/Language-C%2B%2B-red)
@@ -23,86 +23,97 @@ HuntingSpirit는 플레이어들이 협동하여 절차적으로 생성된 위�
 ### 1. 🌐 지능형 매치메이킹 파이프라인
 **소스**: `Networking/Matchmaking/HSMatchmakingSystem.*`
 
-- 실측 핑 데이터를 기반으로 지역 가중치를 계산하고, 세션 검색 결과에서 최적의 매치를 선별합니다.
-- 세션 검색/참여를 Unreal Online Subsystem에 직접 위임해 실제 서버에 접속합니다.
-- 매치 수락/거절 타임아웃, 지역별 대역폭 추적, 자동 재검색 로직을 포함합니다.
+- `DetectOptimalRegion`에서 누적 핑 통계를 사용해 지역을 재선택하고, `SkillToleranceBase`를 기점으로 허용 범위를 자동 확장합니다.
+- 큐 처리/예상 대기시간/매치 수락 타이머를 분리해 UI와 서버 로그가 동일한 상태를 공유합니다.
+- 검색 결과는 `PendingSessionResult`·`bHasPendingSessionResult`로 캐싱돼 재검색 없이도 세션 참여를 이어갑니다.
 
 ```cpp
-// 지역별 핑 통계를 축적해 최적의 매치 후보를 고릅니다.
-FHSMatchInfo MatchInfo = BuildMatchInfoFromResult(*BestResult, BestRegion);
-UpdateMatchmakingStatus(EHSMatchmakingStatus::MatchFound);
-OnMatchFound.Broadcast(MatchInfo);
+GetWorld()->GetTimerManager().SetTimer(
+    MatchmakingTimerHandle,
+    this,
+    &UHSMatchmakingSystem::ProcessMatchmakingQueue,
+    1.0f,
+    true
+);
 ```
+
+1초 주기의 큐 틱이 매치 상태를 지속적으로 재평가해 수동 새로고침 없이도 최신 정보를 유지합니다.
 
 ### 2. 🎮 세션 라이프사이클 자동화
 **소스**: `Networking/SessionHandling/HSSessionManager.*`
 
-- 빠른 매칭은 검색 완료 시 조건에 맞는 세션을 자동 선택·참여합니다.
-- 플레이어 추방/금지 시 OnlineSubsystem ID를 조회하여 실제 세션에서 제거합니다.
-- 핑/패킷 손실률을 실시간 측정하고, 재연결 시도 시 마지막 검색 결과를 활용합니다.
-- 24시간이 지난 밴 레코드와 오래된 세션 검색 결과를 자동 정리합니다.
+- 모든 퍼블릭 API는 `ChangeSessionState`를 통해 상태 머신을 거치며, 실패 시 `HandleSessionError`가 재시도·로그를 처리합니다.
+- 세션 생성 이후 하트비트, 재연결, 밴 기록 정리를 타이머로 구동해 장시간 플레이 시 리소스를 자동으로 정리합니다.
+- 빠른 매치, 수동 검색, 초대 세션을 동일한 코드 경로에서 처리하고 `LastSearchResults`로 검색 결과를 재활용합니다.
 
 ```cpp
-if (SessionInterface->KickPlayer(*LocalPlayerId, NAME_GameSession, *TargetPlayerId))
-{
-    UE_LOG(LogTemp, Log, TEXT("플레이어 추방 성공 - %s"), *PlayerName);
-}
+World->GetTimerManager().SetTimer(SessionHeartbeatTimer, this,
+    &UHSSessionManager::ProcessSessionHeartbeat,
+    SessionHeartbeatInterval, true);
 ```
+
+세션 하트비트는 서버 응답이 없을 때 자동 탈퇴·재접속을 유도해 세션 드리프트를 막습니다.
 
 ### 3. 🛠️ 전용 서버 오케스트레이션
 **소스**: `Networking/DedicatedServer/HSDedicatedServerManager.*`
 
-- CPU/메모리/네트워크/지연 시간 데이터를 플랫폼 API(Windows `GetSystemTimes`, Linux `/proc/stat`)로 측정합니다.
-- JWT/Basic 토큰을 파싱해 인증하며, 보안 이벤트는 `Saved/Logs/SecurityEvents.log`에 축적됩니다.
-- 서버 설정을 JSON으로 직렬화하여 `Saved/Server/HSServerConfig.json`에 저장합니다.
+- 환경별 설정(`LoadServerConfig`)을 읽어 서버 자원 할당·네트워크 리스너 초기화·플랫폼별 부트스트랩을 한 번에 수행합니다.
+- 성능·네트워크·플레이어 메트릭을 주기적으로 수집해 `OnPerformanceMetricsUpdated` 델리게이트로 푸시합니다.
+- 자동 세션 정리, 플레이어 타임아웃, 성능 최적화 루프를 토글 가능한 관리 기능으로 제공합니다.
 
 ```cpp
-if (ServerConfig->SaveConfigurationToFile(ConfigFilePath))
-{
-    UE_LOG(LogTemp, Log, TEXT("서버 설정 저장 완료 - %s"), *ConfigFilePath);
-}
+GetWorld()->GetTimerManager().SetTimer(
+    PerformanceMonitoringTimerHandle,
+    this,
+    &UHSDedicatedServerManager::UpdatePerformanceMetrics,
+    PerformanceUpdateInterval,
+    true
+);
 ```
+
+주기적인 메트릭 업데이트가 CPU/메모리/네트워크 상황을 캐시해 게임 내 진단 화면과 운영 툴에서 바로 활용할 수 있습니다.
 
 ### 4. 🔁 거리 기반 어댑티브 복제
 **소스**: `Networking/Replication/HSReplicationComponent.*`
 
-- Critical 데이터는 즉시 전송, 일반 데이터는 배치 처리하여 대역폭을 절약합니다.
-- 멀티캐스트 시 수신자와의 거리를 계산해 범위 밖 클라이언트를 자동 필터링합니다.
-- 채널별 사용량과 대역폭 초과 이벤트를 추적합니다.
+- 거리 기반 우선순위(`UpdatePriorityBasedOnDistance`)와 채널별 빈도 테이블을 조합해 대역폭을 상황에 맞게 분배합니다.
+- 압축·델타·배치 전송을 지원하는 `PacketQueue`로 패킷 발송을 지연시켜 스파이크를 완화합니다.
+- `AdjustQualityBasedOnBandwidth`가 실시간 대역폭 사용량을 감시해 품질을 올리거나 낮춥니다.
 
 ```cpp
-const float Distance = FVector::Dist(Origin, TargetLocation);
-if (Distance <= MaxDistance && DispatchPacketToClient(Connection, Packet, Payload))
+if (MinDistance < MaxReplicationDistance * 0.2f)
 {
-    ++SuccessfulDispatches;
+    NewPriority = EHSReplicationPriority::RP_VeryHigh;
+}
+SetReplicationPriority(NewPriority);
+```
+
+플레이어와의 거리에 따라 우선순위를 재조정해 전투 중 핵심 액터가 항상 최신 상태로 복제됩니다.
+
+### 5. 🌍 프로시저럴 월드 & 내비게이션 스트리밍
+**소스**: `HuntingSpiritGameMode.cpp`, `World/Generation/HSWorldGenerator.*`, `World/Navigation/HSNavMeshGenerator.*`
+
+- `AHuntingSpiritGameMode::InitializeWorldGeneration`이 월드 생성기와 스폰러를 런타임에 스폰하고 진행 상황을 로깅합니다.
+- `AHSWorldGenerator`는 청크 큐, 바이옴 맵, 보스 스폰 청크를 관리하며 플레이어 주변만 유지합니다.
+- 생성된 지형에 맞춰 내비메시·자원 노드·상호작용 오브젝트를 즉시 갱신해 탐험 흐름을 끊지 않습니다.
+
+```cpp
+while (!ChunkGenerationQueue.IsEmpty() && ChunksGeneratedThisFrame < GenerationSettings.MaxChunksToGeneratePerFrame)
+{
+    ChunkGenerationQueue.Dequeue(ChunkToGenerate);
+    GenerateChunk(ChunkToGenerate);
+    ++ChunksGeneratedThisFrame;
 }
 ```
 
-### 5. 🌍 프로시저럴 월드 & 내비게이션 스트리밍(구현중)
-**소스**: `World/Generation/HSWorldGenerator.*`, `World/Navigation/HSNavMeshGenerator.*`
-
-- 노이즈 기반 바이옴 결정, 멀티스레드 청크 생성, 런타임 메시 구축을 결합하여 무한 월드를 구성합니다.
-- 생성된 지형에 맞춰 내비메시를 즉시 재빌드하며, 필요한 자원 노드(`HSResourceNode`)와 상호작용 오브젝트를 스폰합니다.
-- 스트리밍 진행 상황을 델리게이트로 브로드캐스트해 로딩 UI와 동기화합니다.
-
-```cpp
-ProcessChunkGeneration();
-if (APlayerController* PC = UGameplayStatics::GetPlayerController(GetWorld(), 0))
-{
-    if (APawn* PlayerPawn = PC->GetPawn())
-    {
-        UpdateChunksAroundPlayer(PlayerPawn->GetActorLocation());
-    }
-}
-CleanupDistantChunks();
-```
+프레임당 생성량을 제한하는 큐 기반 스트리밍이 긴 로딩 없이도 넓은 월드를 유지하게 합니다.
 
 ### 6. 🧠 다단계 보스 페이즈 시스템
 **소스**: `Enemies/Bosses/HSBossPhaseSystem.*`, `Enemies/Bosses/HSBossAbilitySystem.*`, `AI/HSBossAIController.*`
 
-- 보스 체력/기믹 조건에 따라 페이즈를 전환하며, 전환 중 무적 처리·연출 타이밍을 자동 관리합니다.
-- 각 페이즈는 능력 세트와 패턴을 독립적으로 보유하고 RPC를 통해 모든 클라이언트와 공유됩니다.
-- 페이즈 전이 횟수, 디버그 로그, 재진입 제한 등 레이드 밸런스 옵션을 제공합니다.
+- 체력 기반 페이즈 결정, 전환 중 무적, 연출 타이밍을 `FHSPhaseTransitionInfo`로 선언적으로 관리합니다.
+- RPC로 클라이언트에 페이즈 상태를 복제하고, 능력 시스템과 연계해 각 페이즈별 스킬 세트를 교체합니다.
+- 디버그 로깅·재진입 제한·페이즈 횟수 누적 등 레이드 튜닝 옵션을 제공해 반복 테스트를 단순화합니다.
 
 ```cpp
 if (NewPhase != CurrentPhase && CanTransitionToPhase(NewPhase))
@@ -111,12 +122,14 @@ if (NewPhase != CurrentPhase && CanTransitionToPhase(NewPhase))
 }
 ```
 
+헬스 퍼센트 변화가 조건을 충족하면 서버가 즉시 전환을 트리거해 모든 클라이언트가 동일한 연출을 보게 됩니다.
+
 ### 7. 💾 로그라이크 메타 진행 & 저장소
 **소스**: `RoguelikeSystem/RunManagement/HSRunManager.*`, `RoguelikeSystem/Persistence/HSPersistentProgress.*`, `RoguelikeSystem/Progression/HSUnlockSystem.*`
 
-- 런 시작/일시정지/종료를 서브시스템으로 관리하며, 보상 계산·통계 집계를 자동화합니다.
-- 진행도는 JSON 기반으로 `Saved/SaveGames/`에 저장되며, 자동 저장 타이머와 버전 마이그레이션 후킹을 제공합니다.
-- 승리/패배에 따라 메타 화폐, 해금 상태, 난이도 기록을 업데이트하여 반복 플레이 동기를 강화합니다.
+- 런 수명주기와 통계를 `HSRunManager`가 관리하고, 메타 화폐·해금 상태는 `HSUnlockSystem`으로 모듈화했습니다.
+- 진행 데이터는 JSON 기반으로 `Saved/SaveGames/HuntingSpiritProgress.json`에 저장되며 버전 마이그레이션 훅을 제공합니다.
+- 자동 저장·수동 저장 모두 `SaveProgressData` 경로를 사용해 UI와 운영 도구의 일관성을 확보했습니다.
 
 ```cpp
 CurrentRun.Rewards = CalculateRunRewards();
@@ -124,26 +137,31 @@ OnRunCompleted.Broadcast(Result, CurrentRun.Rewards);
 SaveProgressData();
 ```
 
-### 8. 🤝 협동 시너지 네트워크(구현중)
-**소스**: `Cooperation/TeamFormation/HSTeamFormationSystem.*`, `Cooperation/SharedAbilities/HSSharedAbilitySystem.*`, `Cooperation/Communication/HSCommunicationSystem.*`
+런 종료 시 계산된 보상과 통계가 즉시 저장돼 충돌이나 강제 종료에서도 메타 진행이 유지됩니다.
 
-- 팀 매칭 후 역할 배분, 합동 스킬 쿨다운, 복합 보상 분배를 서브시스템 단위로 끊어 관리합니다.
-- 실시간 핑/핑백 툴, 합동 능력 발동 등 협력 액션을 멀티캐스트 RPC로 동기화합니다.
-- `HSSynchronizationSystem`과 연계해 팀 버프·합동 공격의 타이밍을 서버 기준으로 보정합니다.
+### 8. 🤝 협동 시너지 네트워크
+**소스**: `Cooperation/HSTeamManager.*`, `Cooperation/SharedAbilities/HSSharedAbilitySystem.*`, `Cooperation/Communication/HSCommunicationSystem.*`, `Cooperation/Synchronization/HSSynchronizationSystem.*`
+
+- `HSTeamManager`가 팀 데이터와 슬롯 제한을 복제하고, 주기적 정리 타이머로 비활성 팀을 제거합니다.
+- `HSSharedAbilitySystem`은 조건·쿨다운·참여자 검증을 통과한 경우에만 합동 능력을 활성화합니다.
+- `HSCommunicationSystem`과 `HSSynchronizationSystem`이 핑·음성·지연 보상을 결합해 협동 액션을 안정적으로 송수신합니다.
 
 ```cpp
-if (SharedAbilitySystem->TryActivateSharedAbility(AbilityId, Participants))
+if (!CanActivateSharedAbility(AbilityID, Participants, FailureReason))
 {
-    OnSharedAbilityActivated.Broadcast(AbilityId, Participants);
+    OnSharedAbilityFailed.Broadcast(AbilityID, FailureReason);
+    return false;
 }
 ```
+
+합동 능력은 서버에서 조건을 최종 검증하므로 지연 상황에서도 잘못된 발동을 사전에 차단합니다.
 
 ### 9. 🚀 성능 최적화 툴킷
 **소스**: `Optimization/HSPerformanceOptimizer.*`
 
-- 플랫폼별 CPU 사용률을 캐싱해 HUD/서버 모니터링에 제공하며, Windows/Linus 모두 지원합니다.
-- `FHighPerformanceObjectPool`은 활성/최대 용량을 추적하며, 동적 확장과 비트마스크 기반 상태 플래그를 제공합니다.
-- SIMD 벡터 배치 연산, XOR 델타 압축, 병렬 플레이어 업데이트 등 대량 데이터 처리를 최적화했습니다.
+- SIMD 벡터 연산·병렬 처리·델타 압축으로 대량 좌표와 회전을 빠르게 처리합니다.
+- 플랫폼별 성능 API를 래핑해 CPU/메모리/네트워크 사용량을 캐시하고, HUD·서버 콘솔에서 재활용할 수 있습니다.
+- 고성능 오브젝트 풀(`FHighPerformanceObjectPool`)이 프레임 중간 할당을 줄여 스파이크를 방지합니다.
 
 ```cpp
 float UHSPerformanceOptimizer::GetCurrentCPUUsage()
@@ -154,30 +172,36 @@ float UHSPerformanceOptimizer::GetCurrentCPUUsage()
 }
 ```
 
+미리 캐시된 성능 수치 덕분에 모니터링 UI는 최소한의 비용으로 최신 리소스 상태를 표시합니다.
+
 ### 10. 📦 오브젝트 풀링
 **소스**: `Optimization/ObjectPool/HSObjectPool.*`
 
-- 인터페이스 기반으로 액터 생성/비활성화 생명주기를 관리하며, 필요 시 자동 확장합니다.
-- 풀링된 액터는 생성 즉시 숨김·충돌 비활성화 상태로 전환되어 즉시 재사용 가능합니다.
+- `IHSPoolableObject` 인터페이스를 통해 액터 생성/비활성/재활성 이벤트를 통일했습니다.
+- 풀 비어 있음과 확장 한도를 감싼 `GetPooledObject`가 생성 전략을 결정하고, 재활성 시 기본 상태를 자동으로 세팅합니다.
+- 런타임에 클래스를 교체하거나 사이즈를 조정해도 기존 액터를 재사용하도록 설계했습니다.
 
 ```cpp
-AActor* AHSObjectPool::CreateNewPooledObject()
+if (InactivePool.Num() > 0)
 {
-    AActor* NewObject = GetWorld()->SpawnActor<AActor>(PooledObjectClass, SpawnParams);
-    NewObject->SetActorHiddenInGame(true);
-    IHSPoolableObject::Execute_OnCreated(NewObject);
-    return NewObject;
+    AActor* PooledObject = InactivePool.Pop();
+    ActivePool.Add(PooledObject);
+    IHSPoolableObject::Execute_OnActivated(PooledObject);
+    return PooledObject;
 }
 ```
+
+재사용 경로가 명시돼 있어 스폰량이 급증하는 구간에서도 GC 히트 없이 안정적인 프레임을 유지합니다.
 
 ---
 
 ## 🧪 테스트 & 운영 체크리스트
 
-- **Dedicated Server**: `HuntingSpiritServer` 타깃을 빌드하고 `-log`, `-port=<포트>` 옵션으로 실행합니다.
-- **클라이언트 매칭**: `HSMatchmakingSystem`으로 빠른 매치/수동 매치를 호출해 지역 자동선택과 세션 참가가 동작하는지 검증하세요.
-- **성능 모니터링**: 서버 실행 중 `HSDedicatedServerManager::OnPerformanceMetricsUpdated` 델리게이트를 구독해 실시간 데이터를 확인합니다.
-- **풀 사용률 확인**: `UHSAdvancedMemoryManager::GetPoolUsageRatio`를 통해 런타임 오브젝트 풀 상태를 모니터링합니다.
+- **Dedicated Server**: `HuntingSpiritServer` 타깃을 빌드해 실행하고 운영 툴에서 성능 메트릭 브로드캐스트를 수신하세요.
+- **매치메이킹 & 세션**: `HSMatchmakingSystem::StartMatchmaking` 후 하트비트가 유지되는지 `HSSessionManager::ProcessSessionHeartbeat` 로그로 확인합니다.
+- **월드 스트리밍**: 플레이어를 스폰해 `HSWorldGenerator::OnWorldGenerationProgress` 델리게이트가 청크 로딩과 언로드를 올바르게 보고하는지 검증합니다.
+- **레이드 협동**: 보스 전투 중 페이즈 전환과 `HSSharedAbilitySystem::TryActivateSharedAbility` 호출을 동시에 테스트해 동기화 안정성을 확인합니다.
+- **진행도 저장**: 런을 완료해 `HSPersistentProgress::SaveProgressData`가 즉시 실행되는지, 저장 파일이 최신 상태로 유지되는지 점검합니다.
 
 ---
 
