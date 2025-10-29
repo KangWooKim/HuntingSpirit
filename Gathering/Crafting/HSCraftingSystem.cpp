@@ -10,7 +10,7 @@
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
 #include "HAL/PlatformFilemanager.h"
-#include "Templates/FunctionRef.h"
+#include "Templates/Function.h"
 
 UHSCraftingSystem::UHSCraftingSystem()
     : NextJobID(1)

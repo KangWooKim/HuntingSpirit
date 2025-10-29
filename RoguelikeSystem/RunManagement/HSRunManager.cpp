@@ -36,7 +36,8 @@ namespace
             return FString();
         }
 
-        if (const TSharedPtr<const FUniqueNetId>& NetId = LocalPlayer->GetPreferredUniqueNetId())
+        const FUniqueNetIdRepl NetId = LocalPlayer->GetPreferredUniqueNetId();
+        if (NetId.IsValid())
         {
             return NetId->ToString();
         }
