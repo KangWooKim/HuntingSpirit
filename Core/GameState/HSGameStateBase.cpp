@@ -871,7 +871,7 @@ void AHSGameStateBase::OptimizeObjectPools()
 {
     if (CoopMechanics)
     {
-        CoopMechanics->InvalidateCache();
+        CoopMechanics->RequestCacheInvalidation();
     }
 
     const int32 ActiveBossCount = WorldState.CurrentBoss.IsValid() ? 1 : 0;

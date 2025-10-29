@@ -39,14 +39,17 @@ void UHSStatsComponent::BeginPlay()
 	}
 	
 	// 자동 회복 타이머 시작
-	if (bAutoRegenerateHealth || bAutoRegenerateMana || bAutoRegenerateStamina)
-	{
-		GetWorld()->GetTimerManager().SetTimer(RegenerationTimerHandle, this, 
-			&UHSStatsComponent::HandleRegeneration, 1.0f, true);
-	}
+		if (bAutoRegenerateHealth || bAutoRegenerateMana || bAutoRegenerateStamina)
+		{
+			if (UWorld* World = GetWorld())
+			{
+				World->GetTimerManager().SetTimer(RegenerationTimerHandle, this,
+					&UHSStatsComponent::HandleRegeneration, 1.0f, true);
+			}
+		}
 
-	RefreshBaseAttributes();
-}
+		RefreshBaseAttributes();
+	}
 
 float UHSStatsComponent::ApplyDamage(float DamageAmount, bool bIgnoreDefense)
 {
@@ -260,18 +263,24 @@ void UHSStatsComponent::EnableAutoRegeneration(bool bEnableHealth, bool bEnableM
 	bAutoRegenerateStamina = bEnableStamina;
 	
 	// 타이머 재설정
-	if (bAutoRegenerateHealth || bAutoRegenerateMana || bAutoRegenerateStamina)
-	{
-		if (!RegenerationTimerHandle.IsValid())
+		if (bAutoRegenerateHealth || bAutoRegenerateMana || bAutoRegenerateStamina)
 		{
-			GetWorld()->GetTimerManager().SetTimer(RegenerationTimerHandle, this, 
-				&UHSStatsComponent::HandleRegeneration, 1.0f, true);
+			if (!RegenerationTimerHandle.IsValid())
+			{
+				if (UWorld* World = GetWorld())
+				{
+					World->GetTimerManager().SetTimer(RegenerationTimerHandle, this,
+						&UHSStatsComponent::HandleRegeneration, 1.0f, true);
+				}
+			}
 		}
-	}
-	else
-	{
-		GetWorld()->GetTimerManager().ClearTimer(RegenerationTimerHandle);
-	}
+		else
+		{
+			if (UWorld* World = GetWorld())
+			{
+				World->GetTimerManager().ClearTimer(RegenerationTimerHandle);
+			}
+		}
 }
 
 void UHSStatsComponent::HandleRegeneration()

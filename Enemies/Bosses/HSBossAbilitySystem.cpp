@@ -198,7 +198,7 @@ void UHSBossAbilitySystem::EndPlay(const EEndPlayReason::Type EndPlayReason)
     InterruptAllAbilities();
     
     // 타이머 정리
-    if (GetWorld())
+    if (UWorld* World = GetWorld())
     {
         FTimerManager& TimerManager = World->GetTimerManager();
         for (auto& Timer : CooldownTimers)
@@ -292,7 +292,7 @@ bool UHSBossAbilitySystem::RemoveAbility(FName AbilityID)
     }
     
     // 타이머 정리
-    if (GetWorld())
+    if (UWorld* World = GetWorld())
     {
         FTimerManager& TimerManager = World->GetTimerManager();
         
@@ -328,7 +328,7 @@ void UHSBossAbilitySystem::ClearAllAbilities()
     InterruptAllAbilities();
     
     // 모든 타이머 정리
-    if (GetWorld())
+    if (UWorld* World = GetWorld())
     {
         FTimerManager& TimerManager = World->GetTimerManager();
         

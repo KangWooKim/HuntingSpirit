@@ -297,21 +297,22 @@ void UHSSaveGameData::ApplyInputSettings() const
 
 void UHSSaveGameData::ApplyGameplaySettings() const
 {
+    const float ClampedScale = FMath::Clamp(GameplaySettings.UIScale, 0.5f, 3.0f);
+    
     if (UGameInstance* GameInstance = ResolvePrimaryGameInstance())
     {
         if (UHSSaveGameManager* SaveManager = GameInstance->GetSubsystem<UHSSaveGameManager>())
         {
             SaveManager->EnableAutoSave(GameplaySettings.bAutoSaveEnabled, GameplaySettings.AutoSaveInterval);
         }
-
-        if (UGameViewportClient* Viewport = GameInstance->GetGameViewport())
-        {
-            const float ClampedScale = FMath::Clamp(GameplaySettings.UIScale, 0.5f, 3.0f);
-            Viewport->SetViewportScale(ClampedScale);
-            SetRuntimeCVar(TEXT("hs.UI.Scale"), ClampedScale);
-        }
     }
-
+    
+    if (FSlateApplication::IsInitialized())
+    {
+        FSlateApplication::Get().SetApplicationScale(ClampedScale);
+    }
+    
+    SetRuntimeCVar(TEXT("hs.UI.Scale"), ClampedScale);
     SetRuntimeCVarBool(TEXT("hs.Gameplay.DamageNumbers"), GameplaySettings.bDamageNumbersEnabled);
     SetRuntimeCVarBool(TEXT("hs.Gameplay.HealthBars"), GameplaySettings.bHealthBarsEnabled);
     SetRuntimeCVarBool(TEXT("hs.Gameplay.Crosshair"), GameplaySettings.bCrosshairEnabled);
@@ -827,7 +828,7 @@ void UHSSaveGameData::ApplyAudioSettingsToEngine() const
     {
         if (FAudioDevice* AudioDevice = GEngine->GetMainAudioDeviceRaw())
         {
-            AudioDevice->SetTransientMasterVolume(MasterVolume);
+            AudioDevice->SetTransientPrimaryVolume(MasterVolume);
         }
     }
 

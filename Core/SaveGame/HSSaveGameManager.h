@@ -68,7 +68,7 @@ struct FHSSaveSlotInfo
     int32 SaveDataVersion = 1;
 
     UPROPERTY(BlueprintReadWrite, Category = "Save Slot")
-    uint32 Checksum = 0;
+    int64 Checksum = 0;
 
     FHSSaveSlotInfo()
     {

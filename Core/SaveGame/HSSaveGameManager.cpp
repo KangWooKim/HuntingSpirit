@@ -20,6 +20,7 @@
 #include "Policies/CondensedJsonPrintPolicy.h"
 #include "Compression/CompressionUtil.h"
 #include "Misc/SecureHash.h"
+#include "Hash/Blake3.h"
 #include "UObject/UObjectGlobals.h"
 
 UHSSaveGameManager::UHSSaveGameManager()
@@ -263,7 +264,7 @@ bool UHSSaveGameManager::SaveGameSync(int32 SlotIndex, UHSSaveGameData* SaveData
         SlotInfo.bIsAutosave = (SlotIndex == AutoSaveSlotIndex);
         SlotInfo.FileSizeMB = FinalData.Num() / (1024.0f * 1024.0f);
         SlotInfo.SaveDataVersion = SaveData->SaveDataVersion;
-        SlotInfo.Checksum = DataChecksum;
+        SlotInfo.Checksum = static_cast<int64>(DataChecksum);
         
         SaveSlotMetadata(SlotIndex, SlotInfo);
         
@@ -994,7 +995,8 @@ TArray<uint8> UHSSaveGameManager::EncryptData(const TArray<uint8>& Data) const
     for (int32 Offset = 0; Offset < Buffer.Num();)
     {
         FMemory::Memcpy(SeedBuffer.GetData() + KeyBytes.Num(), &Counter, sizeof(uint64));
-        FSHA256::HashBuffer(SeedBuffer.GetData(), SeedBuffer.Num(), HashOutput);
+        const FBlake3Hash Hash = FBlake3::HashBuffer(SeedBuffer.GetData(), SeedBuffer.Num());
+        FMemory::Memcpy(HashOutput, Hash.GetBytes(), sizeof(HashOutput));
 
         for (int32 HashIndex = 0; HashIndex < 32 && Offset < Buffer.Num(); ++HashIndex, ++Offset)
         {
@@ -1037,7 +1039,8 @@ TArray<uint8> UHSSaveGameManager::DecryptData(const TArray<uint8>& EncryptedData
     for (int32 Offset = 0; Offset < Buffer.Num();)
     {
         FMemory::Memcpy(SeedBuffer.GetData() + KeyBytes.Num(), &Counter, sizeof(uint64));
-        FSHA256::HashBuffer(SeedBuffer.GetData(), SeedBuffer.Num(), HashOutput);
+        const FBlake3Hash Hash = FBlake3::HashBuffer(SeedBuffer.GetData(), SeedBuffer.Num());
+        FMemory::Memcpy(HashOutput, Hash.GetBytes(), sizeof(HashOutput));
 
         for (int32 HashIndex = 0; HashIndex < 32 && Offset < Buffer.Num(); ++HashIndex, ++Offset)
         {
@@ -1465,7 +1468,7 @@ FHSSaveSlotInfo UHSSaveGameManager::LoadSlotMetadata(int32 SlotIndex) const
 
             if (JsonObject->TryGetNumberField(TEXT("Checksum"), NumberValue))
             {
-                SlotInfo.Checksum = static_cast<uint32>(NumberValue);
+                SlotInfo.Checksum = static_cast<int64>(NumberValue);
             }
         }
     }

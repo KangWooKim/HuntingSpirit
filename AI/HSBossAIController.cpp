@@ -1078,9 +1078,11 @@ void AHSBossAIController::ValidateTargets()
 
     if (MaxSimultaneousTargets > 0 && CurrentTargets.Num() > MaxSimultaneousTargets)
     {
-        CurrentTargets.Sort([this](AActor* A, AActor* B)
+        CurrentTargets.Sort([this](const AActor& A, const AActor& B)
         {
-            return EvaluateThreatLevel(A) > EvaluateThreatLevel(B);
+            const float ThreatA = EvaluateThreatLevel(const_cast<AActor*>(&A));
+            const float ThreatB = EvaluateThreatLevel(const_cast<AActor*>(&B));
+            return ThreatA > ThreatB;
         });
 
         CurrentTargets.SetNum(MaxSimultaneousTargets);
@@ -1195,9 +1197,9 @@ AActor* AHSBossAIController::SelectTargetByStrategy()
 
                         if (const AHSPlayerCharacter* PlayerChar = Cast<AHSPlayerCharacter>(Target))
                         {
-                            if (const AHSPlayerState* PlayerState = PlayerChar->GetPlayerState<AHSPlayerState>())
+                            if (const AHSPlayerState* PlayerStateComp = PlayerChar->GetPlayerState<AHSPlayerState>())
                             {
-                                if (PlayerState->GetPlayerRole() == PreferredRole)
+                                if (PlayerStateComp->GetPlayerRole() == PreferredRole)
                                 {
                                     float Threat = EvaluateThreatLevel(Target);
                                     if (Threat > BestThreat)

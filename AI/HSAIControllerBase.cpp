@@ -143,20 +143,25 @@ void AHSAIControllerBase::StartAI()
     UBehaviorTree* BehaviorTreeToRun = nullptr;
     if (OwnerEnemy)
     {
-        BehaviorTreeToRun = OwnerEnemy->BehaviorTree;
+        BehaviorTreeToRun = OwnerEnemy->GetBehaviorTree();
     }
 
     if (BehaviorTreeToRun)
     {
-        if (BlackboardComponent && BehaviorTreeToRun->BlackboardAsset)
+        bool bBlackboardReady = true;
+        if (BehaviorTreeToRun->BlackboardAsset)
         {
-            if (!BlackboardComponent->IsInitialized())
+            if (!UseBlackboard(BehaviorTreeToRun->BlackboardAsset, BlackboardComponent))
             {
-                UseBlackboard(BehaviorTreeToRun->BlackboardAsset, BlackboardComponent);
+                UE_LOG(LogTemp, Warning, TEXT("HSAIControllerBase: Failed to initialize blackboard for %s"), *GetName());
+                bBlackboardReady = false;
             }
         }
 
-        RunBehaviorTree(BehaviorTreeToRun);
+        if (bBlackboardReady)
+        {
+            RunBehaviorTree(BehaviorTreeToRun);
+        }
     }
 
     // 블루프린트 이벤트 호출
@@ -186,7 +191,11 @@ void AHSAIControllerBase::StopAI()
 
     if (BlackboardComponent && BlackboardComponent->HasValidAsset())
     {
-        BlackboardComponent->ClearAllValues();
+        const int32 NumKeys = BlackboardComponent->GetNumKeys();
+        for (int32 KeyIndex = 0; KeyIndex < NumKeys; ++KeyIndex)
+        {
+            BlackboardComponent->ClearValue(static_cast<FBlackboard::FKey>(KeyIndex));
+        }
     }
 
     SetCurrentTarget(nullptr);
@@ -590,7 +599,8 @@ EHSNavigationRequestResult AHSAIControllerBase::MoveToLocationAdvanced(const FVe
             MoveRequest.SetGoalLocation(TargetLocation);
             MoveRequest.SetAcceptanceRadius(AcceptanceRadius);
             MoveRequest.SetCanStrafe(bCanStrafe);
-            MoveRequest.SetStopOnOverlap(bStopOnOverlap);
+            MoveRequest.SetReachTestIncludesAgentRadius(bStopOnOverlap);
+            MoveRequest.SetReachTestIncludesGoalRadius(bStopOnOverlap);
             MoveRequest.SetUsePathfinding(bUsePathfinding);
             
             FPathFollowingRequestResult RequestResult = MoveTo(MoveRequest);
@@ -617,7 +627,8 @@ EHSNavigationRequestResult AHSAIControllerBase::MoveToLocationAdvanced(const FVe
         MoveRequest.SetGoalLocation(TargetLocation);
         MoveRequest.SetAcceptanceRadius(AcceptanceRadius);
         MoveRequest.SetCanStrafe(bCanStrafe);
-        MoveRequest.SetStopOnOverlap(bStopOnOverlap);
+        MoveRequest.SetReachTestIncludesAgentRadius(bStopOnOverlap);
+        MoveRequest.SetReachTestIncludesGoalRadius(bStopOnOverlap);
         MoveRequest.SetUsePathfinding(bUsePathfinding);
         
         FPathFollowingRequestResult RequestResult = MoveTo(MoveRequest);

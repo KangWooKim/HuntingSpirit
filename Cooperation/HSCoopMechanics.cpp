@@ -1000,6 +1000,11 @@ void UHSCoopMechanics::TickCoopMechanics(float DeltaTime)
     }
 }
 
+void UHSCoopMechanics::RequestCacheInvalidation()
+{
+    InvalidateCache();
+}
+
 // === 보호된 함수들 ===
 
 // 동시 공격 처리

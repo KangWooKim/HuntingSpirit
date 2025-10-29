@@ -352,6 +352,9 @@ public:
     // 틱 업데이트
     void TickCoopMechanics(float DeltaTime);
 
+    UFUNCTION(BlueprintCallable, Category = "Coop Mechanics|Performance")
+    void RequestCacheInvalidation();
+
     // 이벤트 델리게이트
     UPROPERTY(BlueprintAssignable, Category = "Coop Events")
     FOnCoopActionStarted OnCoopActionStarted;

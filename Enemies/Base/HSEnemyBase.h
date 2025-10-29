@@ -16,6 +16,7 @@
 class UHSCombatComponent;
 class UHSHitReactionComponent;
 class AHSAIControllerBase;
+class UBehaviorTree;
 class UBehaviorTreeComponent;
 class UBlackboardComponent;
 class UPawnSensingComponent;
@@ -142,6 +143,9 @@ public:
 
     UFUNCTION(BlueprintCallable, Category = "Enemy|AI")
     virtual void SetCurrentTarget(AActor* NewTarget);
+
+    UFUNCTION(BlueprintPure, Category = "Enemy|AI")
+    UBehaviorTree* GetBehaviorTree() const { return BehaviorTree; }
 
     // 전투 관련 함수들
     UFUNCTION(BlueprintCallable, Category = "Enemy|Combat")
